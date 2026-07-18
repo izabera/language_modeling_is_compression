@@ -103,6 +103,21 @@ python train.py \
   --seed=0
 ```
 
+Attention uses an exact blockwise softmax by default. Query and key tiles are
+128 tokens wide, so the model never creates the full
+`batch_size * num_heads * sequence_length * sequence_length` score and
+probability arrays. The causal mask is generated one tile at a time as well.
+This is especially useful for the default 2048-byte sequences on CPU, where
+JAX's XLA attention implementation is not a memory-efficient FlashAttention
+kernel. The result is mathematically the same as dense attention, subject to
+the usual small floating-point differences from a different summation order.
+
+Use `--attention_block_size=N` to tune the memory/speed tradeoff. Smaller tiles
+use less peak memory; `--attention_block_size=0` restores the released dense
+path. The selected value is stored in new checkpoints. Checkpoints created by
+older versions are automatically kept on dense attention to preserve their
+numerics.
+
 Use `python train.py --help` to see all options, including architecture
 overrides, gradient clipping, logging frequency, sequence length, and output
 path. The available model-size presets have the following exact parameter

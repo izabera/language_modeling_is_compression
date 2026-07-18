@@ -42,6 +42,9 @@ class TransformerConfig:
   # How much larger the hidden layer of the feedforward network should be
   # compared to the `embedding_dim`.
   widening_factor: int = 4
+  # Size of the query and key tiles used by the exact blockwise attention
+  # implementation. Set to None to use the legacy dense attention path.
+  attention_block_size: int | None = 128
 
 
 # The paper reports rounded parameter counts rather than complete architecture
@@ -115,6 +118,286 @@ def parameter_count(config: TransformerConfig) -> int:
   )
 
 
+def _dense_dot_product_attention(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    mask: jax.Array | None = None,
+) -> jax.Array:
+  """Computes the released dense attention operation.
+
+  Args:
+    query: Query vectors with shape [B, Tq, H, D].
+    key: Key vectors with shape [B, Tk, H, D].
+    value: Value vectors with shape [B, Tk, H, Dv].
+    mask: Optional mask broadcastable to [B, H, Tq, Tk].
+
+  Returns:
+    Attention output with shape [B, Tq, H, Dv].
+  """
+  attention = jnp.einsum('bthd,bThd->bhtT', query, key)
+  attention *= 1.0 / jnp.sqrt(query.shape[-1])
+  if mask is not None:
+    attention = jnp.where(mask, attention, jnp.finfo(jnp.float32).min)
+  normalized_attention = jnn.softmax(attention)
+  return jnp.einsum('bhtT,bThd->bthd', normalized_attention, value)
+
+
+def _blockwise_dot_product_attention(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    *,
+    block_size: int,
+    mask: jax.Array | None = None,
+    is_causal: bool = False,
+) -> jax.Array:
+  """Computes exact attention without materializing the full score matrix.
+
+  The softmax normalizer and weighted values are accumulated online over key
+  blocks. Both scans are rematerialized during backpropagation; without that,
+  reverse-mode autodiff would retain the score tiles and recover quadratic
+  memory use.
+
+  Args:
+    query: Query vectors with shape [B, Tq, H, D].
+    key: Key vectors with shape [B, Tk, H, D].
+    value: Value vectors with shape [B, Tk, H, Dv].
+    block_size: Maximum size of both the query and key blocks.
+    mask: Optional mask broadcastable to [B, H, Tq, Tk]. Passing a dense mask
+      naturally retains the mask's own quadratic storage; causal attention can
+      use `is_causal` instead.
+    is_causal: Whether a query at position t can only attend through position
+      t (inclusive).
+
+  Returns:
+    Attention output with shape [B, Tq, H, Dv].
+  """
+  if block_size <= 0:
+    raise ValueError(
+        f'attention block size must be positive; got {block_size}.'
+    )
+  if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+    raise ValueError('query, key, and value must all have rank 4.')
+
+  batch_size, query_length, num_heads, query_depth = query.shape
+  key_batch_size, key_length, key_num_heads, key_depth = key.shape
+  value_batch_size, value_length, value_num_heads, value_depth = value.shape
+  if query_length == 0:
+    return jnp.zeros(
+        (batch_size, 0, num_heads, value_depth), dtype=value.dtype
+    )
+  if key_length == 0:
+    raise ValueError('key and value sequences must not be empty.')
+  if (
+      key_batch_size != batch_size
+      or value_batch_size != batch_size
+      or key_num_heads != num_heads
+      or value_num_heads != num_heads
+      or key_depth != query_depth
+      or value_length != key_length
+  ):
+    raise ValueError('query, key, and value shapes are incompatible.')
+
+  # Internally use [B, H, T, D], which makes each score tile and its running
+  # softmax statistics contiguous in the final dimensions.
+  query = jnp.transpose(query, (0, 2, 1, 3))
+  key = jnp.transpose(key, (0, 2, 1, 3))
+  value = jnp.transpose(value, (0, 2, 1, 3))
+
+  query_block_size = min(block_size, query_length)
+  key_block_size = min(block_size, key_length)
+  num_query_blocks = (
+      query_length + query_block_size - 1
+  ) // query_block_size
+  num_key_blocks = (key_length + key_block_size - 1) // key_block_size
+  padded_query_length = num_query_blocks * query_block_size
+  padded_key_length = num_key_blocks * key_block_size
+
+  query = jnp.pad(
+      query, ((0, 0), (0, 0), (0, padded_query_length - query_length), (0, 0))
+  )
+  key = jnp.pad(
+      key, ((0, 0), (0, 0), (0, padded_key_length - key_length), (0, 0))
+  )
+  value = jnp.pad(
+      value,
+      ((0, 0), (0, 0), (0, padded_key_length - key_length), (0, 0)),
+  )
+
+  def to_blocks(
+      array: jax.Array, num_blocks: int, current_block_size: int
+  ) -> jax.Array:
+    blocks = jnp.reshape(
+        array,
+        (
+            batch_size,
+            num_heads,
+            num_blocks,
+            current_block_size,
+            array.shape[-1],
+        ),
+    )
+    return jnp.transpose(blocks, (2, 0, 1, 3, 4))
+
+  query_blocks = to_blocks(query, num_query_blocks, query_block_size)
+  key_blocks = to_blocks(key, num_key_blocks, key_block_size)
+  value_blocks = to_blocks(value, num_key_blocks, key_block_size)
+
+  padded_mask = None
+  if mask is not None:
+    mask = jnp.broadcast_to(
+        jnp.asarray(mask, dtype=jnp.bool_),
+        (batch_size, num_heads, query_length, key_length),
+    )
+    padded_mask = jnp.pad(
+        mask,
+        (
+            (0, 0),
+            (0, 0),
+            (0, padded_query_length - query_length),
+            (0, padded_key_length - key_length),
+        ),
+        constant_values=False,
+    )
+
+  key_block_indices = jnp.arange(num_key_blocks, dtype=jnp.int32)
+  query_block_indices = jnp.arange(num_query_blocks, dtype=jnp.int32)
+  query_offsets = jnp.arange(query_block_size, dtype=jnp.int32)
+  key_offsets = jnp.arange(key_block_size, dtype=jnp.int32)
+  scale = 1.0 / jnp.sqrt(query_depth)
+  score_dtype = jnp.result_type(query.dtype, key.dtype)
+  accumulator_dtype = jnp.result_type(score_dtype, value.dtype)
+  # This is only selected for an explicitly all-masked row, matching the
+  # legacy use of a finite minimum score (whose softmax is uniform).
+  all_masked_output = jnp.mean(
+      value[:, :, :key_length, :].astype(accumulator_dtype), axis=2
+  )
+
+  def query_step(
+      unused_carry: None,
+      inputs: tuple[jax.Array, jax.Array],
+  ) -> tuple[None, jax.Array]:
+    query_block_index, query_block = inputs
+    query_start = query_block_index * query_block_size
+    query_positions = query_start + query_offsets
+
+    running_max = jnp.full(
+        (batch_size, num_heads, query_block_size),
+        -jnp.inf,
+        dtype=score_dtype,
+    )
+    running_sum = jnp.zeros_like(running_max)
+    running_output = jnp.zeros(
+        (batch_size, num_heads, query_block_size, value_depth),
+        dtype=accumulator_dtype,
+    )
+    has_valid_key = jnp.zeros_like(running_max, dtype=jnp.bool_)
+
+    def key_step(
+        carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        key_inputs: tuple[jax.Array, jax.Array, jax.Array],
+    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array, jax.Array], None]:
+      key_block_index, key_block, value_block = key_inputs
+      key_start = key_block_index * key_block_size
+
+      def process_block(
+          current: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        current_max, current_sum, current_output, current_has_valid = current
+        scores = jnp.einsum(
+            'bhqd,bhkd->bhqk', query_block, key_block
+        )
+        scores *= scale
+
+        key_positions = key_start + key_offsets
+        valid = key_positions[None, :] < key_length
+        valid = jnp.broadcast_to(
+            valid[None, None, :, :],
+            (batch_size, num_heads, query_block_size, key_block_size),
+        )
+        if is_causal:
+          causal = key_positions[None, :] <= query_positions[:, None]
+          valid = jnp.logical_and(valid, causal[None, None, :, :])
+        if padded_mask is not None:
+          mask_block = jax.lax.dynamic_slice(
+              padded_mask,
+              (0, 0, query_start, key_start),
+              (batch_size, num_heads, query_block_size, key_block_size),
+          )
+          valid = jnp.logical_and(valid, mask_block)
+
+        masked_scores = jnp.where(valid, scores, -jnp.inf)
+        block_max = jnp.max(masked_scores, axis=-1)
+        new_max = jnp.maximum(current_max, block_max)
+        safe_max = jnp.where(jnp.isfinite(new_max), new_max, 0)
+        old_scale = jnp.exp(
+            jnp.where(
+                jnp.isfinite(current_max), current_max - safe_max, -jnp.inf
+            )
+        )
+        weights = jnp.exp(
+            jnp.where(
+                valid, scores - safe_max[..., None], -jnp.inf
+            )
+        )
+        new_sum = old_scale * current_sum + jnp.sum(weights, axis=-1)
+        new_output = old_scale[..., None] * current_output
+        new_output += jnp.einsum(
+            'bhqk,bhkd->bhqd', weights, value_block
+        )
+        new_has_valid = jnp.logical_or(
+            current_has_valid, jnp.any(valid, axis=-1)
+        )
+        return new_max, new_sum, new_output, new_has_valid
+
+      if is_causal:
+        last_query_position = jnp.minimum(
+            query_start + query_block_size - 1, query_length - 1
+        )
+        carry = jax.lax.cond(
+            key_start <= last_query_position,
+            process_block,
+            lambda current: current,
+            carry,
+        )
+      else:
+        carry = process_block(carry)
+      return carry, None
+
+    rematerialized_key_step = jax.checkpoint(
+        key_step, prevent_cse=False
+    )
+    (_, denominator, numerator, has_valid_key), _ = jax.lax.scan(
+        rematerialized_key_step,
+        (running_max, running_sum, running_output, has_valid_key),
+        (key_block_indices, key_blocks, value_blocks),
+    )
+    output = numerator / jnp.where(has_valid_key, denominator, 1)[..., None]
+    output = jnp.where(
+        has_valid_key[..., None],
+        output,
+        all_masked_output[:, :, None, :],
+    )
+    return unused_carry, output
+
+  rematerialized_query_step = jax.checkpoint(
+      query_step, prevent_cse=False
+  )
+  _, output_blocks = jax.lax.scan(
+      rematerialized_query_step,
+      None,
+      (query_block_indices, query_blocks),
+  )
+  output = jnp.transpose(output_blocks, (1, 2, 0, 3, 4))
+  output = jnp.reshape(
+      output,
+      (batch_size, num_heads, padded_query_length, value_depth),
+  )
+  output = output[:, :, :query_length, :]
+  return jnp.transpose(output, (0, 2, 1, 3))
+
+
 class MultiHeadDotProductAttention(hk.Module):
   """Multi-head dot-product attention (Vaswani et al., 2017)."""
 
@@ -123,6 +406,8 @@ class MultiHeadDotProductAttention(hk.Module):
       num_heads: int,
       num_hiddens_per_head: int,
       name: str | None = None,
+      *,
+      attention_block_size: int | None = 128,
   ) -> None:
     """Initializes the attention module.
 
@@ -130,16 +415,26 @@ class MultiHeadDotProductAttention(hk.Module):
       num_heads: Number of heads to use.
       num_hiddens_per_head: Number of hidden neurons per head.
       name: Name of the module.
+      attention_block_size: Maximum query/key tile size for blockwise
+        attention, or None to use dense attention.
     """
     super().__init__(name=name)
+    if attention_block_size is not None and attention_block_size <= 0:
+      raise ValueError(
+          'attention block size must be positive or None; got '
+          f'{attention_block_size}.'
+      )
     self._num_heads = num_heads
     self._num_hiddens_per_head = num_hiddens_per_head
+    self._attention_block_size = attention_block_size
 
   def __call__(
       self,
       inputs_q: jax.Array,
       inputs_kv: jax.Array,
       mask: jax.Array | None = None,
+      *,
+      is_causal: bool = False,
   ) -> jax.Array:
     """Returns the output of the multi-head attention."""
     batch_size, sequence_length, embedding_size = inputs_q.shape
@@ -157,16 +452,26 @@ class MultiHeadDotProductAttention(hk.Module):
     k = jnp.reshape(k, new_shape)
     v = jnp.reshape(v, new_shape)
 
-    # Let b=batch_size, t=seq_len, h=num_heads, and d=num_hiddens_per_head.
-    attention = jnp.einsum('bthd,bThd->bhtT', q, k)
-    attention *= 1.0 / jnp.sqrt(self._num_hiddens_per_head)
-
-    if mask is not None:
-      attention = jnp.where(mask, attention, jnp.finfo(jnp.float32).min)
-
-    normalized_attention = jnn.softmax(attention)
-
-    output = jnp.einsum('bhtT,bThd->bthd', normalized_attention, v)
+    if self._attention_block_size is None:
+      if is_causal:
+        query_length = q.shape[1]
+        key_length = k.shape[1]
+        causal_mask = np.tril(
+            np.ones((batch_size, 1, query_length, key_length))
+        )
+        mask = causal_mask if mask is None else jnp.logical_and(
+            mask, causal_mask
+        )
+      output = _dense_dot_product_attention(q, k, v, mask)
+    else:
+      output = _blockwise_dot_product_attention(
+          q,
+          k,
+          v,
+          block_size=self._attention_block_size,
+          mask=mask,
+          is_causal=is_causal,
+      )
     output = jnp.reshape(output, (batch_size, sequence_length, num_hiddens))
     return hk.Linear(embedding_size, with_bias=False)(output)
 
@@ -255,19 +560,29 @@ def transformer_decoder(
   # Embeds the inputs and adds positional encodings.
   embeddings = embed_sequences(inputs, config)
 
-  batch_size, sequence_length = embeddings.shape[:2]
-
-  # The causal mask is shared across heads.
-  causal_mask = np.tril(
-      np.ones((batch_size, 1, sequence_length, sequence_length))
-  )
+  causal_mask = None
+  if config.attention_block_size is None:
+    batch_size, sequence_length = embeddings.shape[:2]
+    # Preserve the released dense operation for old checkpoints.
+    causal_mask = np.tril(
+        np.ones((batch_size, 1, sequence_length, sequence_length))
+    )
 
   h = embeddings
   for _ in range(config.num_layers):
-    self_attention = MultiHeadDotProductAttention(
+    attention_module = MultiHeadDotProductAttention(
         num_heads=config.num_heads,
         num_hiddens_per_head=config.embedding_dim // config.num_heads,
-    )(inputs_q=h, inputs_kv=h, mask=causal_mask)
+        attention_block_size=config.attention_block_size,
+    )
+    if config.attention_block_size is None:
+      self_attention = attention_module(
+          inputs_q=h, inputs_kv=h, mask=causal_mask
+      )
+    else:
+      self_attention = attention_module(
+          inputs_q=h, inputs_kv=h, is_causal=True
+      )
     attention = layer_norm(h + self_attention)
 
     # Position-wise feedforward network.

@@ -112,6 +112,12 @@ _WIDENING_FACTOR = flags.DEFINE_integer(
     None,
     'Feed-forward widening override; by default the preset is used.',
 )
+_ATTENTION_BLOCK_SIZE = flags.DEFINE_integer(
+    'attention_block_size',
+    128,
+    'Query/key tile size for exact blockwise attention; 0 uses dense '
+    'attention.',
+)
 _OUTPUT_PATH = flags.DEFINE_string(
     'output_path', 'params.npz', 'Path for the trained model checkpoint.'
 )
@@ -152,6 +158,7 @@ def _resolve_model_config(
     num_layers: int | None = None,
     num_heads: int | None = None,
     widening_factor: int | None = None,
+    attention_block_size: int | None = 128,
 ) -> transformer.TransformerConfig:
   """Resolves a model-size preset with optional architecture overrides."""
   config = transformer.config_for_model_size(
@@ -164,10 +171,11 @@ def _resolve_model_config(
       'num_heads': num_heads,
       'widening_factor': widening_factor,
   }
-  return dataclasses.replace(
+  config = dataclasses.replace(
       config,
       **{name: value for name, value in overrides.items() if value is not None},
   )
+  return dataclasses.replace(config, attention_block_size=attention_block_size)
 
 
 def _validate_training_arguments(
@@ -235,6 +243,14 @@ def _validate_training_arguments(
     raise ValueError(
         'embedding_dim must be divisible by num_heads; got '
         f'{config.embedding_dim} and {config.num_heads}.'
+    )
+  if (
+      config.attention_block_size is not None
+      and config.attention_block_size <= 0
+  ):
+    raise ValueError(
+        'attention_block_size must be positive or None; got '
+        f'{config.attention_block_size}.'
     )
 
 
@@ -404,12 +420,17 @@ def train_transformer_decoder(
   expected_parameter_count = transformer.parameter_count(config)
   logging.info(
       'Model: %s parameters, embedding_dim=%d, num_layers=%d, '
-      'num_heads=%d, widening_factor=%d',
+      'num_heads=%d, widening_factor=%d, attention=%s',
       f'{expected_parameter_count:,}',
       config.embedding_dim,
       config.num_layers,
       config.num_heads,
       config.widening_factor,
+      (
+          f'blockwise-{config.attention_block_size}'
+          if config.attention_block_size is not None
+          else 'dense'
+      ),
   )
   logging.info(
       'Training: optimizer=%s, learning_rate=%g, batch_size=%d, '
@@ -507,6 +528,7 @@ def main(argv: list[str]) -> None:
       num_layers=_NUM_LAYERS.value,
       num_heads=_NUM_HEADS.value,
       widening_factor=_WIDENING_FACTOR.value,
+      attention_block_size=_ATTENTION_BLOCK_SIZE.value or None,
   )
   try:
     _validate_training_arguments(

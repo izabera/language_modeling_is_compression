@@ -41,9 +41,12 @@ def load(
     }
     if _CONFIG_KEY in data.files:
       serialized_config = str(data[_CONFIG_KEY].item())
-      config = transformer.TransformerConfig(
-          **json.loads(serialized_config)
-      )
+      config_values = json.loads(serialized_config)
+      # Checkpoints written before blockwise attention must keep the released
+      # dense operation order, which can affect arithmetic-coded bitstreams at
+      # floating-point rounding boundaries.
+      config_values.setdefault('attention_block_size', None)
+      config = transformer.TransformerConfig(**config_values)
     else:
-      config = default_config
+      config = dataclasses.replace(default_config, attention_block_size=None)
   return params, config
