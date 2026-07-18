@@ -114,6 +114,7 @@ counts in this implementation:
 | `800k` | 128 | 4 | 8 | 856,832 |
 | `3.2m` | 256 | 4 | 8 | 3,286,272 |
 | `6.4m` | 256 | 8 | 8 | 6,441,216 |
+| `38m` | 512 | 12 | 8 | 38,066,432 |
 
 The labels describe parameter scale and preserve the released implementation's
 default of eight attention heads. The

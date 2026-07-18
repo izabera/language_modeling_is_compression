@@ -47,7 +47,11 @@ class TransformerConfig:
 # The paper reports rounded parameter counts rather than complete architecture
 # definitions. These presets preserve the released implementation's default of
 # eight attention heads; head count does not affect parameter count. The 6.4M
-# preset naturally extends the 3.2M model from four to eight layers.
+# preset naturally extends the 3.2M model from four to eight layers. The 38M
+# preset continues the family's width doubling (64 -> 128 -> 256 -> 512) at
+# twelve layers: its non-embedding parameter count (37,804,032) rounds to the
+# paper's label exactly as the smaller presets' counts round to theirs
+# (198,912 / 791,040 / 3,154,944 / 6,309,888).rs.
 MODEL_SIZE_PRESETS: Mapping[str, Mapping[str, int]] = {
     '200k': {
         'embedding_dim': 64,
@@ -70,6 +74,12 @@ MODEL_SIZE_PRESETS: Mapping[str, Mapping[str, int]] = {
     '6.4m': {
         'embedding_dim': 256,
         'num_layers': 8,
+        'num_heads': 8,
+        'widening_factor': 4,
+    },
+    '38m': {
+        'embedding_dim': 512,
+        'num_layers': 12,
         'num_heads': 8,
         'widening_factor': 4,
     },
