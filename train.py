@@ -116,7 +116,7 @@ def _update_parameters(
 def train_transformer_decoder(
     training_steps: int,
     log_every: int,
-    batch_size: int = 128,
+    batch_size: int = 1,
     sequence_length: int = constants.CHUNK_SIZE_BYTES,
     use_tqdm: bool = True,
 ) -> tuple[hk.Params, float]:
@@ -199,6 +199,7 @@ def main(_) -> None:
       training_steps=100,
       log_every=10,
       sequence_length=constants.CHUNK_SIZE_BYTES,
+      batch_size=1,
   )
   logging.info('Final loss: %f', loss)
 
