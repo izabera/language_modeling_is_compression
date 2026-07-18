@@ -1,0 +1,21 @@
+[project]
+name = "language-modeling-is-compression"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "absl-py>=2.5.0",
+    "audioop-lts>=0.2.2",
+    "chex>=0.1.92",
+    "dm-haiku>=0.0.16",
+    "dm-tree>=0.1.10",
+    "jax==0.10.2",
+    "numpy>=2.5.1",
+    "optax>=0.2.8",
+    "pillow>=12.3.0",
+    "pydub>=0.25.1",
+    "tensorflow>=2.21.0",
+    "tensorflow-datasets>=4.9.10",
+    "tqdm>=4.69.0",
+]
