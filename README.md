@@ -91,10 +91,49 @@ If you want to compress with a language model, you need to train it first using:
 python train.py
 ```
 
+Training options are available as command-line flags. For example:
+
+```bash
+python train.py \
+  --model_size=800k \
+  --batch_size=1 \
+  --training_steps=1000 \
+  --learning_rate=1e-4 \
+  --optimizer=adam \
+  --seed=0
+```
+
+Use `python train.py --help` to see all options, including architecture
+overrides, gradient clipping, logging frequency, sequence length, and output
+path. The available model-size presets have the following exact parameter
+counts in this implementation:
+
+| Preset | Embedding dimension | Layers | Heads | Parameters |
+| --- | ---: | ---: | ---: | ---: |
+| `200k` | 64 | 4 | 8 | 231,936 |
+| `800k` | 128 | 4 | 8 | 856,832 |
+| `3.2m` | 256 | 4 | 8 | 3,286,272 |
+| `6.4m` | 256 | 8 | 8 | 6,441,216 |
+
+The labels describe parameter scale and preserve the released implementation's
+default of eight attention heads. The
+[authors' paper configuration notes](https://github.com/google-deepmind/language_modeling_is_compression/issues/15#issuecomment-2231329302)
+specify four heads for the 200K and 800K experiments as well as rotary
+positional encodings, whereas this repository implements fixed sinusoidal
+encodings. Use `--num_heads=4` for the paper's small-model head count. The
+`6.4m` preset is the natural eight-layer extension of the four-layer `3.2m`
+configuration.
+
+The default batch size is 1 to keep memory use modest. Checkpoints include the
+model configuration, so non-default model sizes can be loaded for compression.
+
 To evaluate the compression rates, use:
 ```bash
 python compress.py
 ```
+
+Pass `--model_path` to `compress.py` when the training checkpoint was written
+somewhere other than the default `params.npz`.
 
 
 ## Citing This Work

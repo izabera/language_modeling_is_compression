@@ -24,32 +24,39 @@ import numpy as np
 
 from language_modeling_is_compression import arithmetic_coder
 from language_modeling_is_compression import constants
+from language_modeling_is_compression import model_checkpoint
 from language_modeling_is_compression import transformer
 from language_modeling_is_compression import utils
 
 
-def _retrieve_model_params() -> hk.Params:
-  """Returns the trained model parameters.
+def _retrieve_model(
+    model_path: str = 'params.npz',
+) -> tuple[hk.Params, transformer.TransformerConfig]:
+  """Returns the trained model parameters and architecture.
 
   Raises:
-    FileNotFoundError if the file params.npz does not exist yet, in which case
+    FileNotFoundError if the model checkpoint does not exist yet, in which case
     the user should launch a training with train.py first.
   """
   try:
-    with np.load('params.npz', allow_pickle=True) as data:
-      return {key: data[key].item() for key in data.files}
+    return model_checkpoint.load(
+        model_path,
+        default_config=transformer.TransformerConfig(
+            vocab_size=constants.ALPHABET_SIZE
+        ),
+    )
   except FileNotFoundError as exc:
     raise FileNotFoundError(
-        'You must train a model first, the parameters file params.npz does not'
-        ' exist yet.'
+        'You must train a model first; the model checkpoint '
+        f'{model_path!r} does not exist yet.'
     ) from exc
 
 
 def _retrieve_predict_fn(
     params: hk.Params,
+    config: transformer.TransformerConfig,
 ) -> Callable[[np.ndarray], np.ndarray]:
   """Returns the prediction function for the trained model."""
-  config = transformer.TransformerConfig(vocab_size=constants.ALPHABET_SIZE)
   model = hk.transform(
       functools.partial(transformer.transformer_decoder, config=config)
   )
@@ -60,6 +67,7 @@ def compress(
     data: bytes,
     return_num_padded_bits: bool = False,
     use_slow_lossless_compression: bool = False,
+    model_path: str = 'params.npz',
 ) -> bytes | tuple[bytes, int]:
   """Compresses the `data` using arithmetic coding and a pretrained model.
 
@@ -75,12 +83,13 @@ def compress(
       the latter is O(n^2). However, the goal is to losslessly decompress the
       compressed output, use the second option (i.e., `True`) since this is what
       happens in the decoder (which iteratively reconstructs the sequence).
+    model_path: Path to the trained model checkpoint.
 
   Returns:
     The compressed data.
   """
-  params = _retrieve_model_params()
-  predict_fn = _retrieve_predict_fn(params)
+  params, config = _retrieve_model(model_path)
+  predict_fn = _retrieve_predict_fn(params, config)
 
   # Convert the `data` into an array of integers (representing the bytes).
   sequence_array = np.frombuffer(data, dtype=np.uint8)
@@ -120,6 +129,7 @@ def decompress(
     data: bytes,
     num_padded_bits: int = 0,
     uncompressed_length: int = constants.CHUNK_SIZE_BYTES,
+    model_path: str = 'params.npz',
 ) -> bytes:
   """Decompresses the `data` using arithmetic coding and a pretrained model.
 
@@ -130,12 +140,13 @@ def decompress(
     num_padded_bits: The number of zeros added to the encoded bitstream in order
       to make it byte-decodeable (i.e., divisble by 8).
     uncompressed_length: The length of the original data stream (in bytes).
+    model_path: Path to the trained model checkpoint.
 
   Returns:
     The decompressed data.
   """
-  params = _retrieve_model_params()
-  predict_fn = _retrieve_predict_fn(params)
+  params, config = _retrieve_model(model_path)
+  predict_fn = _retrieve_predict_fn(params, config)
 
   data_iter = iter(utils.bytes_to_bits(data, num_padded_bits=num_padded_bits))
 

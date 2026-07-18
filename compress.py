@@ -48,6 +48,11 @@ _NUM_CHUNKS = flags.DEFINE_integer(
     constants.NUM_CHUNKS,
     'Number of chunks.',
 )
+_MODEL_PATH = flags.DEFINE_string(
+    'model_path',
+    'params.npz',
+    'Model checkpoint to use with the language_model compressor.',
+)
 
 
 def evaluate_compressor_chunked(
@@ -143,6 +148,10 @@ def main(_) -> None:
   logging.info('Dataset: %s', _DATASET.value)
 
   compress_fn = compressor.COMPRESS_FN_DICT[_COMPRESSOR.value]
+  if _COMPRESSOR.value == 'language_model':
+    compress_fn = functools.partial(
+        compress_fn, model_path=_MODEL_PATH.value
+    )
   get_data_generator_fn = functools.partial(
       data_loaders.GET_DATA_GENERATOR_FN_DICT[_DATASET.value],
       num_chunks=_NUM_CHUNKS.value,

@@ -1,0 +1,49 @@
+"""Saves and loads model parameters together with their architecture."""
+
+import dataclasses
+import json
+import os
+
+import haiku as hk
+import numpy as np
+
+from language_modeling_is_compression import transformer
+
+
+_CONFIG_KEY = '__transformer_config__'
+
+
+def save(
+    path: str | os.PathLike[str],
+    params: hk.Params,
+    config: transformer.TransformerConfig,
+) -> None:
+  """Saves model parameters and the config required to use them."""
+  serialized_config = json.dumps(dataclasses.asdict(config), sort_keys=True)
+  # Passing a file handle prevents numpy from silently appending ".npz" when a
+  # caller deliberately chooses a different checkpoint suffix.
+  with open(path, 'wb') as checkpoint_file:
+    np.savez(
+        checkpoint_file,
+        **params,
+        **{_CONFIG_KEY: np.asarray(serialized_config)},
+    )
+
+
+def load(
+    path: str | os.PathLike[str],
+    default_config: transformer.TransformerConfig,
+) -> tuple[hk.Params, transformer.TransformerConfig]:
+  """Loads parameters and config, including legacy parameter-only files."""
+  with np.load(path, allow_pickle=True) as data:
+    params = {
+        key: data[key].item() for key in data.files if key != _CONFIG_KEY
+    }
+    if _CONFIG_KEY in data.files:
+      serialized_config = str(data[_CONFIG_KEY].item())
+      config = transformer.TransformerConfig(
+          **json.loads(serialized_config)
+      )
+    else:
+      config = default_config
+  return params, config

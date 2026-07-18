@@ -15,6 +15,7 @@
 
 """Transformer model."""
 
+from collections.abc import Mapping
 import dataclasses
 
 import haiku as hk
@@ -41,6 +42,67 @@ class TransformerConfig:
   # How much larger the hidden layer of the feedforward network should be
   # compared to the `embedding_dim`.
   widening_factor: int = 4
+
+
+# The paper reports rounded parameter counts rather than complete architecture
+# definitions. These presets preserve the released implementation's default of
+# eight attention heads; head count does not affect parameter count. The 6.4M
+# preset naturally extends the 3.2M model from four to eight layers.
+MODEL_SIZE_PRESETS: Mapping[str, Mapping[str, int]] = {
+    '200k': {
+        'embedding_dim': 64,
+        'num_layers': 4,
+        'num_heads': 8,
+        'widening_factor': 4,
+    },
+    '800k': {
+        'embedding_dim': 128,
+        'num_layers': 4,
+        'num_heads': 8,
+        'widening_factor': 4,
+    },
+    '3.2m': {
+        'embedding_dim': 256,
+        'num_layers': 4,
+        'num_heads': 8,
+        'widening_factor': 4,
+    },
+    '6.4m': {
+        'embedding_dim': 256,
+        'num_layers': 8,
+        'num_heads': 8,
+        'widening_factor': 4,
+    },
+}
+
+
+def config_for_model_size(
+    model_size: str,
+    vocab_size: int,
+) -> TransformerConfig:
+  """Builds a Transformer config from a rounded parameter-count preset."""
+  try:
+    preset = MODEL_SIZE_PRESETS[model_size]
+  except KeyError as exc:
+    valid_sizes = ', '.join(MODEL_SIZE_PRESETS)
+    raise ValueError(
+        f'Unknown model size {model_size!r}; expected one of {valid_sizes}.'
+    ) from exc
+  return TransformerConfig(vocab_size=vocab_size, **preset)
+
+
+def parameter_count(config: TransformerConfig) -> int:
+  """Returns the exact number of trainable parameters for this architecture."""
+  dim = config.embedding_dim
+  widening = config.widening_factor
+  parameters_per_layer = (
+      (4 + 2 * widening) * dim**2 + (widening + 5) * dim
+  )
+  return (
+      2 * config.vocab_size * dim
+      + config.vocab_size
+      + config.num_layers * parameters_per_layer
+  )
 
 
 class MultiHeadDotProductAttention(hk.Module):
