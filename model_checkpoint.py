@@ -46,7 +46,12 @@ def load(
       # dense operation order, which can affect arithmetic-coded bitstreams at
       # floating-point rounding boundaries.
       config_values.setdefault('attention_block_size', None)
+      # Checkpoints written before the scanned layer stack store one entry
+      # per layer rather than stacked arrays, so they must keep the loop.
+      config_values.setdefault('remat_layers', False)
       config = transformer.TransformerConfig(**config_values)
     else:
-      config = dataclasses.replace(default_config, attention_block_size=None)
+      config = dataclasses.replace(
+          default_config, attention_block_size=None, remat_layers=False
+      )
   return params, config

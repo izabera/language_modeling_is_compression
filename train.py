@@ -118,6 +118,13 @@ _ATTENTION_BLOCK_SIZE = flags.DEFINE_integer(
     'Query/key tile size for exact blockwise attention; 0 uses dense '
     'attention.',
 )
+_REMAT_LAYERS = flags.DEFINE_bool(
+    'remat_layers',
+    True,
+    'Apply the Transformer layers as a scanned stack and recompute each '
+    'layer during backpropagation instead of storing its interior '
+    'activations. Changes the parameter layout of new checkpoints.',
+)
 _OUTPUT_PATH = flags.DEFINE_string(
     'output_path', 'params.npz', 'Path for the trained model checkpoint.'
 )
@@ -159,6 +166,7 @@ def _resolve_model_config(
     num_heads: int | None = None,
     widening_factor: int | None = None,
     attention_block_size: int | None = 256,
+    remat_layers: bool = True,
 ) -> transformer.TransformerConfig:
   """Resolves a model-size preset with optional architecture overrides."""
   config = transformer.config_for_model_size(
@@ -175,7 +183,11 @@ def _resolve_model_config(
       config,
       **{name: value for name, value in overrides.items() if value is not None},
   )
-  return dataclasses.replace(config, attention_block_size=attention_block_size)
+  return dataclasses.replace(
+      config,
+      attention_block_size=attention_block_size,
+      remat_layers=remat_layers,
+  )
 
 
 def _validate_training_arguments(
@@ -447,7 +459,7 @@ def train_transformer_decoder(
   expected_parameter_count = transformer.parameter_count(config)
   logging.info(
       'Model: %s parameters, embedding_dim=%d, num_layers=%d, '
-      'num_heads=%d, widening_factor=%d, attention=%s',
+      'num_heads=%d, widening_factor=%d, attention=%s, remat_layers=%s',
       f'{expected_parameter_count:,}',
       config.embedding_dim,
       config.num_layers,
@@ -458,6 +470,7 @@ def train_transformer_decoder(
           if config.attention_block_size is not None
           else 'dense'
       ),
+      config.remat_layers,
   )
   logging.info(
       'Training: optimizer=%s, learning_rate=%g, batch_size=%d, '
@@ -557,6 +570,7 @@ def main(argv: list[str]) -> None:
       num_heads=_NUM_HEADS.value,
       widening_factor=_WIDENING_FACTOR.value,
       attention_block_size=_ATTENTION_BLOCK_SIZE.value or None,
+      remat_layers=_REMAT_LAYERS.value,
   )
   try:
     _validate_training_arguments(

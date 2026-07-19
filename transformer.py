@@ -45,6 +45,14 @@ class TransformerConfig:
   # Size of the query and key tiles used by the exact blockwise attention
   # implementation. Set to None to use the legacy dense attention path.
   attention_block_size: int | None = 256
+  # Whether to apply the layers as a scanned stack whose body is
+  # rematerialized during backpropagation. Only layer-boundary activations
+  # are stored; layer interiors are recomputed when needed, trading roughly
+  # one extra forward pass for a large reduction in stored activations.
+  # Parameters gain a leading num_layers axis under the 'layers' scope, so
+  # this choice is part of the checkpoint format; checkpoints written before
+  # this option exist keep the unstacked per-layer layout.
+  remat_layers: bool = True
 
 
 # The paper reports rounded parameter counts rather than complete architecture
@@ -594,8 +602,7 @@ def transformer_decoder(
         np.ones((batch_size, 1, sequence_length, sequence_length))
     )
 
-  h = embeddings
-  for _ in range(config.num_layers):
+  def layer(h: jax.Array) -> jax.Array:
     attention_module = MultiHeadDotProductAttention(
         num_heads=config.num_heads,
         num_hiddens_per_head=config.embedding_dim // config.num_heads,
@@ -612,10 +619,27 @@ def transformer_decoder(
     attention = layer_norm(h + self_attention)
 
     # Position-wise feedforward network.
-    h = hk.Linear(config.embedding_dim * config.widening_factor)(attention)
-    h = jnn.gelu(h)
-    h = hk.Linear(config.embedding_dim)(h)
-    h = layer_norm(h + attention)
+    hiddens = hk.Linear(config.embedding_dim * config.widening_factor)(
+        attention
+    )
+    hiddens = jnn.gelu(hiddens)
+    hiddens = hk.Linear(config.embedding_dim)(hiddens)
+    return layer_norm(hiddens + attention)
+
+  h = embeddings
+  if config.remat_layers:
+    # A scanned layer stack with a rematerialized body. The scan is what
+    # makes rematerialization effective: it gives every layer's buffers a
+    # bounded lifetime, whereas in an unrolled loop XLA is free to schedule
+    # the recomputation right after the original values, keeping the stored
+    # activations alive and saving nothing.
+    stack = hk.experimental.layer_stack(config.num_layers, name='layers')(
+        hk.remat(layer)
+    )
+    h = stack(h)
+  else:
+    for _ in range(config.num_layers):
+      h = layer(h)
 
   logits = hk.Linear(config.vocab_size)(h)
   return jnn.log_softmax(logits, axis=-1)

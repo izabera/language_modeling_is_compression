@@ -118,6 +118,19 @@ path. The selected value is stored in new checkpoints. Checkpoints created by
 older versions are automatically kept on dense attention to preserve their
 numerics.
 
+The Transformer layers are additionally applied as a scanned layer stack
+whose body is rematerialized during backpropagation (`hk.remat` inside
+`hk.experimental.layer_stack`): only the layer-boundary activations are
+stored, and layer interiors are recomputed when the backward pass needs
+them. This trades roughly one extra forward pass of compute for a large
+reduction in stored activations. The scan is what makes rematerialization
+effective on the CPU backend, where XLA schedules an unrolled loop's
+recomputation eagerly and would otherwise keep the stored activations alive
+anyway. Layer parameters are stored stacked (one array per weight with a
+leading `num_layers` axis), so the choice is part of the checkpoint format:
+checkpoints written by older versions keep the unstacked layout and the
+plain loop. Use `--noremat_layers` to disable it for new trainings.
+
 Use `python train.py --help` to see all options, including architecture
 overrides, gradient clipping, logging frequency, sequence length, and output
 path. The available model-size presets have the following exact parameter
