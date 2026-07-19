@@ -82,21 +82,33 @@ _TRAINING_STEPS = flags.DEFINE_integer(
 )
 _CONVERGENCE_PATIENCE = flags.DEFINE_integer(
     'convergence_patience',
-    5,
-    'Stop early after this many loss windows without sufficient improvement; '
-    '0 disables convergence stopping.',
+    10,
+    'Stop early after this many fixed-validation checks without sufficient '
+    'improvement; 0 disables convergence stopping.',
 )
 _CONVERGENCE_MIN_DELTA = flags.DEFINE_float(
     'convergence_min_delta',
-    1e-4,
-    'Minimum decrease in mean nats/byte required to reset convergence '
-    'patience.',
+    1e-3,
+    'Minimum cumulative decrease in validation nats/byte required to reset '
+    'convergence patience.',
 )
-_CONVERGENCE_WINDOW = flags.DEFINE_integer(
-    'convergence_window',
-    100,
-    'Number of consecutive training steps averaged for each convergence '
-    'check.',
+_CONVERGENCE_CHECK_INTERVAL = flags.DEFINE_float(
+    'convergence_check_interval',
+    0.25,
+    'Number of Enwik8-equivalent sampled-data passes between fixed-validation '
+    'checks.',
+)
+_CONVERGENCE_MIN_PASSES = flags.DEFINE_float(
+    'convergence_min_passes',
+    5.0,
+    'Minimum number of Enwik8-equivalent sampled-data passes before the first '
+    'fixed-validation check.',
+)
+_CONVERGENCE_VALIDATION_CHUNKS = flags.DEFINE_integer(
+    'convergence_validation_chunks',
+    512,
+    'Number of deterministic, stratified Enwik8 chunks reserved for '
+    'convergence validation.',
 )
 _LOG_EVERY = flags.DEFINE_integer(
     'log_every', 10, 'Log metrics every N steps; 0 disables step logging.'
@@ -224,8 +236,10 @@ def _validate_training_arguments(
     gradient_clip_norm: float,
     config: transformer.TransformerConfig,
     convergence_patience: int = 0,
-    convergence_min_delta: float = 1e-4,
-    convergence_window: int = 100,
+    convergence_min_delta: float = 1e-3,
+    convergence_check_interval: float = 0.25,
+    convergence_min_passes: float = 5.0,
+    convergence_validation_chunks: int = 512,
 ) -> None:
   """Validates training and architecture settings."""
   positive_values = {
@@ -237,7 +251,6 @@ def _validate_training_arguments(
       'num_layers': config.num_layers,
       'num_heads': config.num_heads,
       'widening_factor': config.widening_factor,
-      'convergence_window': convergence_window,
   }
   for name, value in positive_values.items():
     if value <= 0:
@@ -247,7 +260,6 @@ def _validate_training_arguments(
       'momentum': momentum,
       'weight_decay': weight_decay,
       'gradient_clip_norm': gradient_clip_norm,
-      'convergence_min_delta': convergence_min_delta,
   }
   for name, value in finite_values.items():
     if not math.isfinite(value):
@@ -259,19 +271,34 @@ def _validate_training_arguments(
         'convergence_patience must be non-negative; got '
         f'{convergence_patience}.'
     )
-  if convergence_min_delta < 0:
-    raise ValueError(
-        'convergence_min_delta must be non-negative; got '
-        f'{convergence_min_delta}.'
-    )
   if convergence_patience > 0:
-    minimum_steps = (convergence_patience + 1) * convergence_window
-    if training_steps < minimum_steps:
+    convergence_finite_values = {
+        'convergence_min_delta': convergence_min_delta,
+        'convergence_check_interval': convergence_check_interval,
+        'convergence_min_passes': convergence_min_passes,
+    }
+    for name, value in convergence_finite_values.items():
+      if not math.isfinite(value):
+        raise ValueError(f'{name} must be finite; got {value}.')
+    if convergence_min_delta < 0:
       raise ValueError(
-          'training_steps must be at least '
-          f'{minimum_steps} when convergence stopping is enabled '
-          '(one baseline window plus convergence_patience windows); got '
-          f'{training_steps}.'
+          'convergence_min_delta must be non-negative; got '
+          f'{convergence_min_delta}.'
+      )
+    if convergence_check_interval <= 0:
+      raise ValueError(
+          'convergence_check_interval must be positive; got '
+          f'{convergence_check_interval}.'
+      )
+    if convergence_min_passes < 0:
+      raise ValueError(
+          'convergence_min_passes must be non-negative; got '
+          f'{convergence_min_passes}.'
+      )
+    if convergence_validation_chunks <= 0:
+      raise ValueError(
+          'convergence_validation_chunks must be positive; got '
+          f'{convergence_validation_chunks}.'
       )
   if optimizer_name not in ('adam', 'adamw', 'sgd', 'rmsprop'):
     raise ValueError(f'Unknown optimizer {optimizer_name!r}.')
@@ -294,6 +321,17 @@ def _validate_training_arguments(
     raise ValueError(
         'sequence_length cannot exceed the Enwik8 training-set size '
         f'({constants.ENWIK8_SIZE_BYTES} bytes).'
+    )
+  training_chunk_count = constants.ENWIK8_SIZE_BYTES // sequence_length
+  if (
+      convergence_patience > 0
+      and convergence_validation_chunks >= training_chunk_count
+  ):
+    raise ValueError(
+        'convergence_validation_chunks must leave at least one Enwik8 chunk '
+        'for training; got '
+        f'{convergence_validation_chunks} validation chunks out of '
+        f'{training_chunk_count}.'
     )
   if config.embedding_dim % config.num_heads:
     raise ValueError(
@@ -354,30 +392,99 @@ def _loss_statistics(
 
 @dataclasses.dataclass
 class _ConvergenceMonitor:
-  """Tracks consecutive mean-loss windows without sufficient improvement."""
+  """Tracks meaningful improvements on one fixed validation set.
+
+  ``best_validation_loss`` is used to select the checkpoint.  The separate
+  ``reference_validation_loss`` is only advanced by ``min_delta`` so that a
+  series of individually small improvements can accumulate and reset
+  patience.  Keeping these roles separate also ensures that the lowest-loss
+  parameters are retained even when the decrease is smaller than
+  ``min_delta``.
+  """
 
   patience: int
   min_delta: float
-  best_mean_loss: float = math.inf
-  windows_without_improvement: int = 0
+  best_validation_loss: float = math.inf
+  best_step: int = 0
+  reference_validation_loss: float = math.inf
+  checks_without_improvement: int = 0
 
-  def update(self, mean_loss: float) -> bool:
-    """Adds a normalized window mean and reports whether training converged."""
-    if not math.isfinite(mean_loss):
-      raise ValueError(f'Training loss must be finite; got {mean_loss}.')
+  def update(self, validation_loss: float, step: int) -> bool:
+    """Adds a validation loss and reports whether patience is exhausted."""
+    if not math.isfinite(validation_loss):
+      raise ValueError(
+          f'Validation loss must be finite; got {validation_loss}.'
+      )
 
-    improvement = self.best_mean_loss - mean_loss
-    improved = (
-        self.best_mean_loss == math.inf
-        or (mean_loss < self.best_mean_loss and improvement >= self.min_delta)
-    )
-    if improved:
-      self.best_mean_loss = mean_loss
-      self.windows_without_improvement = 0
+    if validation_loss < self.best_validation_loss:
+      self.best_validation_loss = validation_loss
+      self.best_step = step
+
+    if self.reference_validation_loss == math.inf:
+      self.reference_validation_loss = validation_loss
+      self.checks_without_improvement = 0
+      return False
+
+    improvement = self.reference_validation_loss - validation_loss
+    if validation_loss < self.reference_validation_loss and (
+        improvement >= self.min_delta
+    ):
+      self.reference_validation_loss = validation_loss
+      self.checks_without_improvement = 0
     else:
-      self.windows_without_improvement += 1
+      self.checks_without_improvement += 1
 
-    return self.windows_without_improvement >= self.patience
+    return self.checks_without_improvement >= self.patience
+
+
+def _stratified_validation_indices(
+    total_chunks: int, validation_chunks: int
+) -> tuple[int, ...]:
+  """Returns deterministic midpoint indices from equal-width corpus strata."""
+  if total_chunks <= 1:
+    raise ValueError(
+        f'total_chunks must be greater than one; got {total_chunks}.'
+    )
+  if not 0 < validation_chunks < total_chunks:
+    raise ValueError(
+        'validation_chunks must be between one and total_chunks - 1; got '
+        f'{validation_chunks} out of {total_chunks}.'
+    )
+  return tuple(
+      ((2 * index + 1) * total_chunks) // (2 * validation_chunks)
+      for index in range(validation_chunks)
+  )
+
+
+def _convergence_schedule(
+    *,
+    batch_size: int,
+    sequence_length: int,
+    min_passes: float,
+    check_interval: float,
+) -> tuple[int, int]:
+  """Converts data-equivalent passes to update counts for this batch size."""
+  bytes_per_update = batch_size * sequence_length
+  first_check_step = max(
+      1,
+      math.ceil(
+          min_passes * constants.ENWIK8_SIZE_BYTES / bytes_per_update
+      ),
+  )
+  check_interval_steps = max(
+      1,
+      math.ceil(
+          check_interval * constants.ENWIK8_SIZE_BYTES / bytes_per_update
+      ),
+  )
+  return first_check_step, check_interval_steps
+
+
+def _copy_params_to_host(params: hk.Params) -> hk.Params:
+  """Copies donated JAX parameter buffers into an independent host snapshot."""
+  return tree.map_structure(
+      lambda value: np.array(jax.device_get(value), copy=True), params
+  )
 
 
 def _to_marginals(
@@ -392,28 +499,54 @@ def _to_marginals(
   return jnp.sum(true_predictions, axis=1)  # Shape (B,).
 
 
-def _make_loss_fn(model: hk.Transformed) -> Any:
-  """Returns the loss function for update_parameters."""
+def _make_per_sequence_loss_fn(model: hk.Transformed) -> Any:
+  """Returns a function producing one summed negative log-loss per sequence."""
 
-  def loss_fn(
+  def per_sequence_loss_fn(
       params: hk.Params,
       sequences: jax.Array,
-  ) -> jnp.float32:
-    """Returns the loss for the model and the last state.
-
-    Args:
-      params: The parameters of the model, usually a neural network.
-      sequences: The input of sequences to evaluate. See neural_predictors.py.
-    """
+  ) -> jax.Array:
     conditionals = model.apply(
         params=params,
         targets=sequences,
         rng=None,
     )
     marginals = _to_marginals(conditionals, sequences)
-    return -jnp.mean(marginals)
+    return -marginals
+
+  return per_sequence_loss_fn
+
+
+def _make_loss_fn(model: hk.Transformed) -> Any:
+  """Returns the mean batch loss function for parameter updates."""
+  per_sequence_loss_fn = _make_per_sequence_loss_fn(model)
+
+  def loss_fn(
+      params: hk.Params,
+      sequences: jax.Array,
+  ) -> jnp.float32:
+    return jnp.mean(per_sequence_loss_fn(params, sequences))
 
   return loss_fn
+
+
+def _evaluate_validation_losses(
+    params: hk.Params,
+    validation_data: np.ndarray,
+    per_sequence_loss_fn: Any,
+    batch_size: int,
+    sequence_length: int,
+) -> np.ndarray:
+  """Evaluates fixed validation data in bounded-memory microbatches."""
+  losses = []
+  for start in range(0, len(validation_data), batch_size):
+    batch = validation_data[start : start + batch_size]
+    batch_losses = jax.device_get(per_sequence_loss_fn(params, batch))
+    losses.append(np.asarray(batch_losses, dtype=np.float64))
+  normalized_losses = np.concatenate(losses) / sequence_length
+  if not np.all(np.isfinite(normalized_losses)):
+    raise ValueError('Validation loss must be finite.')
+  return normalized_losses
 
 
 def _initialize_parameters(model: hk.Transformed, seed: int) -> hk.Params:
@@ -502,8 +635,10 @@ def train_transformer_decoder(
     gradient_clip_norm: float = 0.0,
     normalize_gradients: bool = True,
     convergence_patience: int = 0,
-    convergence_min_delta: float = 1e-4,
-    convergence_window: int = 100,
+    convergence_min_delta: float = 1e-3,
+    convergence_check_interval: float = 0.25,
+    convergence_min_passes: float = 5.0,
+    convergence_validation_chunks: int = 512,
 ) -> tuple[hk.Params, float]:
   """Trains a language model on Enwik8 data.
 
@@ -527,15 +662,21 @@ def train_transformer_decoder(
     weight_decay: Weight decay used by AdamW.
     gradient_clip_norm: Global gradient clipping norm, or 0 to disable it.
     normalize_gradients: Whether to normalize gradients by sequence length.
-    convergence_patience: Stop after this many mean-loss windows without a
-      sufficient improvement. Set to 0 to disable convergence stopping.
+    convergence_patience: Stop after this many fixed-validation checks without
+      a sufficient improvement. Set to 0 to disable convergence stopping.
     convergence_min_delta: Minimum nats/byte decrease that counts as an
       improvement for convergence stopping.
-    convergence_window: Number of consecutive batch losses averaged for each
-      convergence check.
+    convergence_check_interval: Number of Enwik8-equivalent sampled-data
+      passes between validation checks.
+    convergence_min_passes: Minimum number of Enwik8-equivalent sampled-data
+      passes before establishing the validation baseline.
+    convergence_validation_chunks: Number of deterministic, stratified Enwik8
+      chunks held out from training for validation.
 
   Returns:
-    The final parameters and loss.
+    The selected parameters and their summed fixed-validation loss when
+    convergence stopping is enabled. Otherwise, the final parameters and the
+    last pre-update training-batch loss are returned.
   """
   config = model_config or transformer.TransformerConfig(
       vocab_size=constants.ALPHABET_SIZE
@@ -554,7 +695,9 @@ def train_transformer_decoder(
       config=config,
       convergence_patience=convergence_patience,
       convergence_min_delta=convergence_min_delta,
-      convergence_window=convergence_window,
+      convergence_check_interval=convergence_check_interval,
+      convergence_min_passes=convergence_min_passes,
+      convergence_validation_chunks=convergence_validation_chunks,
   )
   expected_parameter_count = transformer.parameter_count(config)
   logging.info(
@@ -583,26 +726,84 @@ def train_transformer_decoder(
       seed,
       gradient_clip_norm,
   )
-  if convergence_patience > 0:
+  convergence_enabled = convergence_patience > 0
+  if convergence_enabled:
+    first_validation_step, validation_interval_steps = _convergence_schedule(
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+        min_passes=convergence_min_passes,
+        check_interval=convergence_check_interval,
+    )
     logging.info(
-        'Convergence stopping: patience=%d windows, window=%d steps, '
-        'min_delta=%g nats/byte, maximum_steps=%d',
+        'Convergence stopping: fixed validation=%d chunks, first check=%d '
+        'steps (%.3f Enwik8-equivalent sampled-byte passes), interval=%d '
+        'steps (%.3f passes), '
+        'patience=%d checks, min_delta=%g nats/byte, maximum_steps=%d',
+        convergence_validation_chunks,
+        first_validation_step,
+        first_validation_step * batch_size * sequence_length
+        / constants.ENWIK8_SIZE_BYTES,
+        validation_interval_steps,
+        validation_interval_steps * batch_size * sequence_length
+        / constants.ENWIK8_SIZE_BYTES,
         convergence_patience,
-        convergence_window,
         convergence_min_delta,
         training_steps,
     )
+    earliest_stop_step = (
+        first_validation_step
+        + convergence_patience * validation_interval_steps
+    )
+    if earliest_stop_step > training_steps:
+      logging.warning(
+          'The %d-step safety cap is earlier than the first possible '
+          'pre-cap convergence stop at step %d; increase training_steps if '
+          'automatic stopping should control this run.',
+          training_steps,
+          earliest_stop_step,
+      )
+  else:
+    first_validation_step = 0
+    validation_interval_steps = 0
   model = hk.transform(
       functools.partial(transformer.transformer_decoder, config=config)
   )
 
+  training_chunk_count = constants.ENWIK8_SIZE_BYTES // sequence_length
   data_generator = data_loaders.get_enwik9_iterator(
-      num_chunks=constants.ENWIK8_SIZE_BYTES // sequence_length,
+      num_chunks=training_chunk_count,
       sequence_length=sequence_length,
   )
-  dataset = list(data_generator)
-  if not dataset:
+  enwik8_chunks = list(data_generator)
+  if not enwik8_chunks:
     raise ValueError('The Enwik8 training dataset did not contain any chunks.')
+  if any(len(chunk) != sequence_length for chunk in enwik8_chunks):
+    raise ValueError('Enwik8 contained an incomplete training chunk.')
+  if convergence_enabled and len(enwik8_chunks) != training_chunk_count:
+    raise ValueError(
+        'Enwik8 did not contain the expected number of complete training '
+        'chunks.'
+    )
+
+  validation_data = None
+  if convergence_enabled:
+    validation_indices = _stratified_validation_indices(
+        training_chunk_count, convergence_validation_chunks
+    )
+    validation_index_set = set(validation_indices)
+    validation_data = np.stack(
+        [
+            np.frombuffer(enwik8_chunks[index], dtype=np.uint8)
+            for index in validation_indices
+        ]
+    )
+    dataset = [
+        chunk
+        for index, chunk in enumerate(enwik8_chunks)
+        if index not in validation_index_set
+    ]
+  else:
+    dataset = enwik8_chunks
 
   batch_random = random.Random(seed)
 
@@ -623,6 +824,11 @@ def train_transformer_decoder(
   # Make gradient function.
   loss_fn = _make_loss_fn(model)
   grad_fn = jax.value_and_grad(loss_fn, has_aux=False)
+  validation_loss_fn = (
+      jax.jit(_make_per_sequence_loss_fn(model))
+      if convergence_enabled
+      else None
+  )
 
   # Make optimizer, to apply the gradients.
   optimizer = _make_optimizer(
@@ -640,12 +846,15 @@ def train_transformer_decoder(
           patience=convergence_patience,
           min_delta=convergence_min_delta,
       )
-      if convergence_patience > 0
+      if convergence_enabled
       else None
   )
-  convergence_loss_window: list[Any] = []
+  next_validation_step = first_validation_step
+  last_validation_step = 0
+  best_params = None
   last_loss = 0.0
   stopped_for_convergence = False
+  converged_at_cap = False
 
   progress_bar = tqdm.trange(training_steps, disable=not use_tqdm)
 
@@ -654,6 +863,46 @@ def train_transformer_decoder(
       progress_bar.write(message % args, file=progress_bar.fp)
     else:
       logging.info(message, *args, stacklevel=2)
+
+  def run_validation(current_params: hk.Params, completed_steps: int) -> bool:
+    """Evaluates and records one checkpoint on the fixed holdout."""
+    nonlocal best_params, last_validation_step
+    assert convergence_monitor is not None
+    assert validation_data is not None
+    assert validation_loss_fn is not None
+    validation_losses = _evaluate_validation_losses(
+        params=current_params,
+        validation_data=validation_data,
+        per_sequence_loss_fn=validation_loss_fn,
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+    )
+    validation_mean = float(np.mean(validation_losses))
+    validation_chunk_sd = (
+        float(np.std(validation_losses, ddof=1))
+        if len(validation_losses) > 1
+        else 0.0
+    )
+    previous_best = convergence_monitor.best_validation_loss
+    converged = convergence_monitor.update(validation_mean, completed_steps)
+    if validation_mean < previous_best:
+      best_params = _copy_params_to_host(current_params)
+    last_validation_step = completed_steps
+    log_progress(
+        'Validation after %d steps (%.3f Enwik8-equivalent sampled-byte '
+        'passes): nats/byte %.6f (chunk SD %.6f), best %.6f at step %d, '
+        'checks without meaningful improvement %d/%d',
+        completed_steps,
+        completed_steps * batch_size * sequence_length
+        / constants.ENWIK8_SIZE_BYTES,
+        validation_mean,
+        validation_chunk_sd,
+        convergence_monitor.best_validation_loss,
+        convergence_monitor.best_step,
+        convergence_monitor.checks_without_improvement,
+        convergence_patience,
+    )
+    return converged
 
   for step in progress_bar:
     batch = fetch_random_batch()
@@ -684,39 +933,51 @@ def train_transformer_decoder(
       )
     last_loss = logs['loss']
 
-    if convergence_monitor is not None:
-      convergence_loss_window.append(logs['loss'])
-      if len(convergence_loss_window) == convergence_window:
-        window_mean_loss = float(
-            jax.device_get(jnp.mean(jnp.stack(convergence_loss_window)))
-        ) / sequence_length
-        convergence_loss_window.clear()
-        converged = convergence_monitor.update(window_mean_loss)
-        log_progress(
-            'Convergence check after %d steps: mean nats/byte %.6f, '
-            'best %.6f, windows without improvement %d/%d',
-            step + 1,
-            window_mean_loss,
-            convergence_monitor.best_mean_loss,
-            convergence_monitor.windows_without_improvement,
-            convergence_patience,
-        )
-        if converged:
+    completed_steps = step + 1
+    if (
+        convergence_monitor is not None
+        and completed_steps == next_validation_step
+    ):
+      converged = run_validation(params, completed_steps)
+      next_validation_step += validation_interval_steps
+      if converged:
+        if completed_steps == training_steps:
+          converged_at_cap = True
+        else:
           log_progress(
-              'Stopping early after %d steps because loss did not improve by '
-              'at least %g nats/byte for %d windows.',
-              step + 1,
+              'Stopping early after %d steps because fixed validation loss '
+              'did not improve by at least %g nats/byte for %d checks.',
+              completed_steps,
               convergence_min_delta,
               convergence_patience,
           )
           stopped_for_convergence = True
           break
 
-  if convergence_monitor is not None and not stopped_for_convergence:
-    logging.info(
-        'Reached the maximum of %d training steps before convergence.',
-        training_steps,
-    )
+  if convergence_monitor is not None:
+    if not stopped_for_convergence:
+      if last_validation_step != training_steps:
+        converged_at_cap = run_validation(params, training_steps)
+      if converged_at_cap:
+        logging.info(
+            'Reached the maximum of %d training steps as validation patience '
+            'was exhausted.',
+            training_steps,
+        )
+      else:
+        logging.info(
+            'Reached the maximum of %d training steps before convergence.',
+            training_steps,
+        )
+    if best_params is not None:
+      params = best_params
+      last_loss = convergence_monitor.best_validation_loss * sequence_length
+      logging.info(
+          'Selected best fixed-validation checkpoint from step %d '
+          '(%.6f nats/byte).',
+          convergence_monitor.best_step,
+          convergence_monitor.best_validation_loss,
+      )
 
   return params, float(jax.device_get(last_loss))
 
@@ -750,7 +1011,9 @@ def main(argv: list[str]) -> None:
         config=config,
         convergence_patience=_CONVERGENCE_PATIENCE.value,
         convergence_min_delta=_CONVERGENCE_MIN_DELTA.value,
-        convergence_window=_CONVERGENCE_WINDOW.value,
+        convergence_check_interval=_CONVERGENCE_CHECK_INTERVAL.value,
+        convergence_min_passes=_CONVERGENCE_MIN_PASSES.value,
+        convergence_validation_chunks=_CONVERGENCE_VALIDATION_CHUNKS.value,
     )
   except ValueError as exc:
     raise app.UsageError(str(exc)) from exc
@@ -776,16 +1039,24 @@ def main(argv: list[str]) -> None:
       normalize_gradients=_NORMALIZE_GRADIENTS.value,
       convergence_patience=_CONVERGENCE_PATIENCE.value,
       convergence_min_delta=_CONVERGENCE_MIN_DELTA.value,
-      convergence_window=_CONVERGENCE_WINDOW.value,
+      convergence_check_interval=_CONVERGENCE_CHECK_INTERVAL.value,
+      convergence_min_passes=_CONVERGENCE_MIN_PASSES.value,
+      convergence_validation_chunks=_CONVERGENCE_VALIDATION_CHUNKS.value,
       use_tqdm=_USE_TQDM.value,
   )
 
   nats_per_byte, bits_per_byte, perplexity = _loss_statistics(
       loss, _SEQUENCE_LENGTH.value
   )
+  loss_source = (
+      'Best fixed-validation checkpoint'
+      if _CONVERGENCE_PATIENCE.value > 0
+      else 'Last pre-update training batch'
+  )
   logging.info(
-      'Final loss: %.6f, nats/byte: %.6f, bits/byte: %.6f, '
+      '%s loss: %.6f, nats/byte: %.6f, bits/byte: %.6f, '
       'perplexity: %.3f',
+      loss_source,
       loss,
       nats_per_byte,
       bits_per_byte,

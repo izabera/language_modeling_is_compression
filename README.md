@@ -112,18 +112,37 @@ and stops sooner when the loss plateaus:
 python train.py \
   --training_steps=1000000 \
   --batch_size=32 \
-  --convergence_patience=5 \
-  --convergence_window=100 \
-  --convergence_min_delta=1e-4
+  --convergence_patience=10 \
+  --convergence_min_delta=1e-3 \
+  --convergence_min_passes=5 \
+  --convergence_check_interval=0.25 \
+  --convergence_validation_chunks=512
 ```
 
-This averages normalized training loss over each 100-step window and stops
-after five consecutive windows fail to improve by at least `1e-4` nats per
-byte. The step count remains a safety cap because randomly sampled minibatch
-loss can be noisy. One window establishes the baseline, so the step cap must
-cover at least `(patience + 1) * window` updates. The checkpoint contains the
-parameters from the stopping step. Use `--convergence_patience=0` to disable
-convergence stopping and run for exactly `training_steps` updates.
+When convergence stopping is enabled, 512 chunks are selected deterministically
+across Enwik8 and removed from the training sampler. The same held-out chunks
+are evaluated every time, avoiding the lucky-minibatch-record behavior of a
+training-loss stopper. Checks begin after five Enwik8-equivalent passes of
+sampled training bytes and then run every quarter pass. Defining the schedule
+in data exposure instead of optimizer steps gives each batch size the same
+volume of sampled training data between checks; optimization itself remains
+batch-size dependent.
+
+Patience resets when the fixed validation loss has cumulatively improved by at
+least `1e-3` nats per byte. Training stops after ten checks without such an
+improvement, and the lowest-validation-loss parameters are saved rather than
+the parameters from the stopping step. Validation chunk-loss spread, best step,
+and sampled-data exposure are included in the logs. `training_steps` remains a
+safety cap, and the checkpoint at that cap is always evaluated before the best
+parameters are selected.
+
+This is a practical plateau heuristic, not proof that the optimizer has found
+a global or asymptotic optimum. For comparisons against a fixed-step published
+recipe, keep automatic stopping disabled.
+
+Use `--convergence_patience=0` to disable validation stopping, train on every
+Enwik8 chunk, and run for exactly `training_steps` updates. This is the setting
+to use when reproducing a fixed-step training recipe exactly.
 
 Attention uses an exact blockwise softmax by default. Query and key tiles are
 256 tokens wide, so the model never creates the full score and probability
@@ -166,11 +185,12 @@ the paper's small-model head count. The
 `6.4m` preset is the natural eight-layer extension of the four-layer `3.2m`
 configuration.
 
-The default batch size is 32, matching the authors' small-model experiments and
-making convergence windows less sensitive to individual random sequences. It
+The default batch size is 32, matching the authors' small-model experiments. It
 is intended for the default 200K model; reduce `--batch_size` when using a
-larger model or a memory-constrained device. Checkpoints include the model
-configuration, so non-default model sizes can be loaded for compression.
+larger model or a memory-constrained device. The convergence schedule adjusts
+its optimizer-step cadence to preserve sampled-byte exposure across batch
+sizes. Checkpoints include the model configuration, so non-default model sizes
+can be loaded for compression.
 
 To evaluate the compression rates, use:
 ```bash
