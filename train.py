@@ -114,7 +114,7 @@ _WIDENING_FACTOR = flags.DEFINE_integer(
 )
 _ATTENTION_BLOCK_SIZE = flags.DEFINE_integer(
     'attention_block_size',
-    128,
+    256,
     'Query/key tile size for exact blockwise attention; 0 uses dense '
     'attention.',
 )
@@ -158,7 +158,7 @@ def _resolve_model_config(
     num_layers: int | None = None,
     num_heads: int | None = None,
     widening_factor: int | None = None,
-    attention_block_size: int | None = 128,
+    attention_block_size: int | None = 256,
 ) -> transformer.TransformerConfig:
   """Resolves a model-size preset with optional architecture overrides."""
   config = transformer.config_for_model_size(

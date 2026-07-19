@@ -44,7 +44,7 @@ class TransformerConfig:
   widening_factor: int = 4
   # Size of the query and key tiles used by the exact blockwise attention
   # implementation. Set to None to use the legacy dense attention path.
-  attention_block_size: int | None = 128
+  attention_block_size: int | None = 256
 
 
 # The paper reports rounded parameter counts rather than complete architecture
@@ -407,7 +407,7 @@ class MultiHeadDotProductAttention(hk.Module):
       num_hiddens_per_head: int,
       name: str | None = None,
       *,
-      attention_block_size: int | None = 128,
+      attention_block_size: int | None = 256,
   ) -> None:
     """Initializes the attention module.
 

@@ -104,7 +104,7 @@ python train.py \
 ```
 
 Attention uses an exact blockwise softmax by default. Query and key tiles are
-128 tokens wide, so the model never creates the full
+256 tokens wide, so the model never creates the full
 `batch_size * num_heads * sequence_length * sequence_length` score and
 probability arrays. The causal mask is generated one tile at a time as well.
 This is especially useful for the default 2048-byte sequences on CPU, where
