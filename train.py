@@ -41,7 +41,7 @@ from language_modeling_is_compression import transformer
 
 
 _BATCH_SIZE = flags.DEFINE_integer(
-    'batch_size', 1, 'Number of sequences in each training batch.'
+    'batch_size', 32, 'Number of sequences in each training batch.'
 )
 _SEED = flags.DEFINE_integer(
     'seed', 0, 'Random seed for parameter initialization and batch sampling.'
@@ -76,7 +76,27 @@ _NORMALIZE_GRADIENTS = flags.DEFINE_bool(
     'Normalize gradients by sequence length before applying updates.',
 )
 _TRAINING_STEPS = flags.DEFINE_integer(
-    'training_steps', 100, 'Number of parameter-update steps.'
+    'training_steps',
+    1_000_000,
+    'Maximum number of parameter-update steps.',
+)
+_CONVERGENCE_PATIENCE = flags.DEFINE_integer(
+    'convergence_patience',
+    5,
+    'Stop early after this many loss windows without sufficient improvement; '
+    '0 disables convergence stopping.',
+)
+_CONVERGENCE_MIN_DELTA = flags.DEFINE_float(
+    'convergence_min_delta',
+    1e-4,
+    'Minimum decrease in mean nats/byte required to reset convergence '
+    'patience.',
+)
+_CONVERGENCE_WINDOW = flags.DEFINE_integer(
+    'convergence_window',
+    100,
+    'Number of consecutive training steps averaged for each convergence '
+    'check.',
 )
 _LOG_EVERY = flags.DEFINE_integer(
     'log_every', 10, 'Log metrics every N steps; 0 disables step logging.'
@@ -203,6 +223,9 @@ def _validate_training_arguments(
     weight_decay: float,
     gradient_clip_norm: float,
     config: transformer.TransformerConfig,
+    convergence_patience: int = 0,
+    convergence_min_delta: float = 1e-4,
+    convergence_window: int = 100,
 ) -> None:
   """Validates training and architecture settings."""
   positive_values = {
@@ -215,6 +238,7 @@ def _validate_training_arguments(
       'num_layers': config.num_layers,
       'num_heads': config.num_heads,
       'widening_factor': config.widening_factor,
+      'convergence_window': convergence_window,
   }
   for name, value in positive_values.items():
     if value <= 0:
@@ -224,12 +248,32 @@ def _validate_training_arguments(
       'momentum': momentum,
       'weight_decay': weight_decay,
       'gradient_clip_norm': gradient_clip_norm,
+      'convergence_min_delta': convergence_min_delta,
   }
   for name, value in finite_values.items():
     if not math.isfinite(value):
       raise ValueError(f'{name} must be finite; got {value}.')
   if log_every < 0:
     raise ValueError(f'log_every must be non-negative; got {log_every}.')
+  if convergence_patience < 0:
+    raise ValueError(
+        'convergence_patience must be non-negative; got '
+        f'{convergence_patience}.'
+    )
+  if convergence_min_delta < 0:
+    raise ValueError(
+        'convergence_min_delta must be non-negative; got '
+        f'{convergence_min_delta}.'
+    )
+  if convergence_patience > 0:
+    minimum_steps = (convergence_patience + 1) * convergence_window
+    if training_steps < minimum_steps:
+      raise ValueError(
+          'training_steps must be at least '
+          f'{minimum_steps} when convergence stopping is enabled '
+          '(one baseline window plus convergence_patience windows); got '
+          f'{training_steps}.'
+      )
   if optimizer_name not in ('adam', 'adamw', 'sgd', 'rmsprop'):
     raise ValueError(f'Unknown optimizer {optimizer_name!r}.')
   if seed < 0:
@@ -296,6 +340,34 @@ def _loss_statistics(
   except OverflowError:
     perplexity = math.inf
   return nats_per_byte, bits_per_byte, perplexity
+
+
+@dataclasses.dataclass
+class _ConvergenceMonitor:
+  """Tracks consecutive mean-loss windows without sufficient improvement."""
+
+  patience: int
+  min_delta: float
+  best_mean_loss: float = math.inf
+  windows_without_improvement: int = 0
+
+  def update(self, mean_loss: float) -> bool:
+    """Adds a normalized window mean and reports whether training converged."""
+    if not math.isfinite(mean_loss):
+      raise ValueError(f'Training loss must be finite; got {mean_loss}.')
+
+    improvement = self.best_mean_loss - mean_loss
+    improved = (
+        self.best_mean_loss == math.inf
+        or (mean_loss < self.best_mean_loss and improvement >= self.min_delta)
+    )
+    if improved:
+      self.best_mean_loss = mean_loss
+      self.windows_without_improvement = 0
+    else:
+      self.windows_without_improvement += 1
+
+    return self.windows_without_improvement >= self.patience
 
 
 def _to_marginals(
@@ -407,7 +479,7 @@ def _update_parameters(
 def train_transformer_decoder(
     training_steps: int,
     log_every: int,
-    batch_size: int = 128,
+    batch_size: int = 32,
     sequence_length: int = constants.CHUNK_SIZE_BYTES,
     use_tqdm: bool = True,
     *,
@@ -419,6 +491,9 @@ def train_transformer_decoder(
     weight_decay: float = 1e-4,
     gradient_clip_norm: float = 0.0,
     normalize_gradients: bool = True,
+    convergence_patience: int = 0,
+    convergence_min_delta: float = 1e-4,
+    convergence_window: int = 100,
 ) -> tuple[hk.Params, float]:
   """Trains a language model on Enwik8 data.
 
@@ -428,7 +503,7 @@ def train_transformer_decoder(
   TransformerConfig object (defined in transformer.py)
 
   Args:
-    training_steps: Number of batches to train on.
+    training_steps: Maximum number of batches to train on.
     log_every: How often to log the loss. Set to 0 to disable step logging.
     batch_size: The number of sequences in a batch.
     sequence_length: The length of the sequences to train on, in number of ASCII
@@ -442,6 +517,12 @@ def train_transformer_decoder(
     weight_decay: Weight decay used by AdamW.
     gradient_clip_norm: Global gradient clipping norm, or 0 to disable it.
     normalize_gradients: Whether to normalize gradients by sequence length.
+    convergence_patience: Stop after this many mean-loss windows without a
+      sufficient improvement. Set to 0 to disable convergence stopping.
+    convergence_min_delta: Minimum nats/byte decrease that counts as an
+      improvement for convergence stopping.
+    convergence_window: Number of consecutive batch losses averaged for each
+      convergence check.
 
   Returns:
     The final parameters and loss.
@@ -461,6 +542,9 @@ def train_transformer_decoder(
       weight_decay=weight_decay,
       gradient_clip_norm=gradient_clip_norm,
       config=config,
+      convergence_patience=convergence_patience,
+      convergence_min_delta=convergence_min_delta,
+      convergence_window=convergence_window,
   )
   expected_parameter_count = transformer.parameter_count(config)
   grouped_attention_block_size = (
@@ -495,6 +579,15 @@ def train_transformer_decoder(
       seed,
       gradient_clip_norm,
   )
+  if convergence_patience > 0:
+    logging.info(
+        'Convergence stopping: patience=%d windows, window=%d steps, '
+        'min_delta=%g nats/byte, maximum_steps=%d',
+        convergence_patience,
+        convergence_window,
+        convergence_min_delta,
+        training_steps,
+    )
   model = hk.transform(
       functools.partial(transformer.transformer_decoder, config=config)
   )
@@ -538,7 +631,17 @@ def train_transformer_decoder(
   opt_state = optimizer.init(params)
 
   logging.info('Initialization done, starting training...')
+  convergence_monitor = (
+      _ConvergenceMonitor(
+          patience=convergence_patience,
+          min_delta=convergence_min_delta,
+      )
+      if convergence_patience > 0
+      else None
+  )
+  convergence_loss_window: list[Any] = []
   last_loss = 0.0
+  stopped_for_convergence = False
   for step in tqdm.trange(training_steps, disable=not use_tqdm):
     batch = fetch_random_batch()
     should_log = log_every > 0 and step % log_every == 0
@@ -567,6 +670,40 @@ def train_transformer_decoder(
           logs['grad_norm_unclipped'],
       )
     last_loss = logs['loss']
+
+    if convergence_monitor is not None:
+      convergence_loss_window.append(logs['loss'])
+      if len(convergence_loss_window) == convergence_window:
+        window_mean_loss = float(
+            jax.device_get(jnp.mean(jnp.stack(convergence_loss_window)))
+        ) / sequence_length
+        convergence_loss_window.clear()
+        converged = convergence_monitor.update(window_mean_loss)
+        logging.info(
+            'Convergence check after %d steps: mean nats/byte %.6f, '
+            'best %.6f, windows without improvement %d/%d',
+            step + 1,
+            window_mean_loss,
+            convergence_monitor.best_mean_loss,
+            convergence_monitor.windows_without_improvement,
+            convergence_patience,
+        )
+        if converged:
+          logging.info(
+              'Stopping early after %d steps because loss did not improve by '
+              'at least %g nats/byte for %d windows.',
+              step + 1,
+              convergence_min_delta,
+              convergence_patience,
+          )
+          stopped_for_convergence = True
+          break
+
+  if convergence_monitor is not None and not stopped_for_convergence:
+    logging.info(
+        'Reached the maximum of %d training steps before convergence.',
+        training_steps,
+    )
 
   return params, float(jax.device_get(last_loss))
 
@@ -598,6 +735,9 @@ def main(argv: list[str]) -> None:
         weight_decay=_WEIGHT_DECAY.value,
         gradient_clip_norm=_GRADIENT_CLIP_NORM.value,
         config=config,
+        convergence_patience=_CONVERGENCE_PATIENCE.value,
+        convergence_min_delta=_CONVERGENCE_MIN_DELTA.value,
+        convergence_window=_CONVERGENCE_WINDOW.value,
     )
   except ValueError as exc:
     raise app.UsageError(str(exc)) from exc
@@ -621,6 +761,9 @@ def main(argv: list[str]) -> None:
       weight_decay=_WEIGHT_DECAY.value,
       gradient_clip_norm=_GRADIENT_CLIP_NORM.value,
       normalize_gradients=_NORMALIZE_GRADIENTS.value,
+      convergence_patience=_CONVERGENCE_PATIENCE.value,
+      convergence_min_delta=_CONVERGENCE_MIN_DELTA.value,
+      convergence_window=_CONVERGENCE_WINDOW.value,
       use_tqdm=_USE_TQDM.value,
   )
 

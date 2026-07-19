@@ -97,12 +97,34 @@ Training options are available as command-line flags. For example:
 python train.py \
   --model_size=800k \
   --byte_group_size=4 \
-  --batch_size=1 \
-  --training_steps=1000 \
+  --batch_size=32 \
+  --training_steps=1000000 \
   --learning_rate=1e-4 \
   --optimizer=adam \
   --seed=0
 ```
+
+`--training_steps` is a safety cap rather than a target. The CLI defaults to
+one million optimizer updates, matching the authors' reported
+[training configuration](https://github.com/google-deepmind/language_modeling_is_compression/issues/15#issuecomment-2231329302),
+and stops sooner when the loss plateaus:
+
+```bash
+python train.py \
+  --training_steps=1000000 \
+  --batch_size=32 \
+  --convergence_patience=5 \
+  --convergence_window=100 \
+  --convergence_min_delta=1e-4
+```
+
+This averages normalized training loss over each 100-step window and stops
+after five consecutive windows fail to improve by at least `1e-4` nats per
+byte. The step count remains a safety cap because randomly sampled minibatch
+loss can be noisy. One window establishes the baseline, so the step cap must
+cover at least `(patience + 1) * window` updates. The checkpoint contains the
+parameters from the stopping step. Use `--convergence_patience=0` to disable
+convergence stopping and run for exactly `training_steps` updates.
 
 The model uses TRACE-style byte grouping by default. Four adjacent history
 bytes are embedded at one quarter of the model width and concatenated into one
@@ -152,8 +174,11 @@ encodings. Use `--num_heads=4` for the paper's small-model head count. The
 `6.4m` preset is the natural eight-layer extension of the four-layer `3.2m`
 configuration.
 
-The default batch size is 1 to keep memory use modest. Checkpoints include the
-model configuration, so non-default model sizes can be loaded for compression.
+The default batch size is 32, matching the authors' small-model experiments and
+making convergence windows less sensitive to individual random sequences. It
+is intended for the default 200K model; reduce `--batch_size` when using a
+larger model or a memory-constrained device. Checkpoints include the model
+configuration, so non-default model sizes can be loaded for compression.
 
 To evaluate the compression rates, use:
 ```bash
