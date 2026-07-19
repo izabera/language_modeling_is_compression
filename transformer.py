@@ -244,6 +244,11 @@ def _blockwise_dot_product_attention(
   key_blocks = to_blocks(key, num_key_blocks, key_block_size)
   value_blocks = to_blocks(value, num_key_blocks, key_block_size)
 
+  # Causal attention without an explicit mask always has at least key zero
+  # available to every query. Avoid tracking that fact through every tile in
+  # the decoder's common path; explicit masks and non-causal attention can
+  # still contain fully masked rows and need the legacy fallback below.
+  track_valid_keys = not (is_causal and mask is None)
   padded_mask = None
   if mask is not None:
     mask = jnp.broadcast_to(
@@ -268,11 +273,13 @@ def _blockwise_dot_product_attention(
   scale = 1.0 / jnp.sqrt(query_depth)
   score_dtype = jnp.result_type(query.dtype, key.dtype)
   accumulator_dtype = jnp.result_type(score_dtype, value.dtype)
-  # This is only selected for an explicitly all-masked row, matching the
-  # legacy use of a finite minimum score (whose softmax is uniform).
-  all_masked_output = jnp.mean(
-      value[:, :, :key_length, :].astype(accumulator_dtype), axis=2
-  )
+  all_masked_output = None
+  if track_valid_keys:
+    # This is only selected for an explicitly all-masked row, matching the
+    # legacy use of a finite minimum score (whose softmax is uniform).
+    all_masked_output = jnp.mean(
+        value[:, :, :key_length, :].astype(accumulator_dtype), axis=2
+    )
 
   def query_step(
       unused_carry: None,
@@ -292,18 +299,28 @@ def _blockwise_dot_product_attention(
         (batch_size, num_heads, query_block_size, value_depth),
         dtype=accumulator_dtype,
     )
-    has_valid_key = jnp.zeros_like(running_max, dtype=jnp.bool_)
+    has_valid_key = (
+        jnp.zeros_like(running_max, dtype=jnp.bool_)
+        if track_valid_keys
+        else None
+    )
 
     def key_step(
-        carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        carry: tuple[
+            jax.Array, jax.Array, jax.Array, jax.Array | None
+        ],
         key_inputs: tuple[jax.Array, jax.Array, jax.Array],
-    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array, jax.Array], None]:
+    ) -> tuple[
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array | None], None
+    ]:
       key_block_index, key_block, value_block = key_inputs
       key_start = key_block_index * key_block_size
 
       def process_block(
-          current: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
-      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+          current: tuple[
+              jax.Array, jax.Array, jax.Array, jax.Array | None
+          ],
+      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
         current_max, current_sum, current_output, current_has_valid = current
         scores = jnp.einsum(
             'bhqd,bhkd->bhqk', query_block, key_block
@@ -346,9 +363,13 @@ def _blockwise_dot_product_attention(
         new_output += jnp.einsum(
             'bhqk,bhkd->bhqd', weights, value_block
         )
-        new_has_valid = jnp.logical_or(
-            current_has_valid, jnp.any(valid, axis=-1)
-        )
+        if track_valid_keys:
+          assert current_has_valid is not None
+          new_has_valid = jnp.logical_or(
+              current_has_valid, jnp.any(valid, axis=-1)
+          )
+        else:
+          new_has_valid = None
         return new_max, new_sum, new_output, new_has_valid
 
       if is_causal:
@@ -373,12 +394,17 @@ def _blockwise_dot_product_attention(
         (running_max, running_sum, running_output, has_valid_key),
         (key_block_indices, key_blocks, value_blocks),
     )
-    output = numerator / jnp.where(has_valid_key, denominator, 1)[..., None]
-    output = jnp.where(
-        has_valid_key[..., None],
-        output,
-        all_masked_output[:, :, None, :],
-    )
+    if track_valid_keys:
+      assert has_valid_key is not None
+      assert all_masked_output is not None
+      output = numerator / jnp.where(has_valid_key, denominator, 1)[..., None]
+      output = jnp.where(
+          has_valid_key[..., None],
+          output,
+          all_masked_output[:, :, None, :],
+      )
+    else:
+      output = numerator / denominator[..., None]
     return unused_carry, output
 
   rematerialized_query_step = jax.checkpoint(
