@@ -1,0 +1,354 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "Transformer training-memory estimate",
+    "description": "Compiler-estimated peak live buffers before and after blockwise attention, for every model preset and requested batch size.",
+    "generatedAt": "2026-07-18T23:25:42Z",
+    "cards": [],
+    "charts": [
+      {
+        "id": "batch1_reduction",
+        "title": "Batch-1 memory reduction by preset",
+        "subtitle": "Ratio of previous dense-attention footprint to current blockwise footprint; higher is better.",
+        "showDescription": true,
+        "type": "bar",
+        "dataset": "batch1_savings",
+        "sourceId": "compiled_memory_measurements",
+        "valueFormat": "number",
+        "encodings": {
+          "x": {
+            "field": "preset",
+            "type": "nominal",
+            "label": "Preset"
+          },
+          "y": {
+            "field": "reduction_ratio",
+            "type": "quantitative",
+            "label": "Memory reduction (\u00d7)",
+            "format": "number"
+          },
+          "tooltip": [
+            {
+              "field": "preset",
+              "type": "nominal",
+              "label": "Preset"
+            },
+            {
+              "field": "reduction_ratio",
+              "type": "quantitative",
+              "label": "Reduction (\u00d7)",
+              "format": "number"
+            },
+            {
+              "field": "previous_gib",
+              "type": "quantitative",
+              "label": "Previous (GiB)",
+              "format": "number"
+            },
+            {
+              "field": "current_gib",
+              "type": "quantitative",
+              "label": "Current (GiB)",
+              "format": "number"
+            }
+          ]
+        }
+      }
+    ],
+    "tables": [
+      {
+        "id": "memory_matrix",
+        "title": "Previous dense \u2192 current blockwise memory",
+        "subtitle": "GiB per full FP32 Adam update at sequence length 2048. \u2248 marks extrapolated previous values; all current values are compiled.",
+        "showDescription": true,
+        "dataset": "comparison_matrix",
+        "sourceId": "compiled_memory_measurements",
+        "columns": [
+          {
+            "field": "preset",
+            "label": "Preset",
+            "type": "text"
+          },
+          {
+            "field": "parameter_count",
+            "label": "Actual parameters",
+            "type": "number",
+            "format": "number"
+          },
+          {
+            "field": "b1",
+            "label": "Batch 1",
+            "type": "text"
+          },
+          {
+            "field": "b4",
+            "label": "Batch 4",
+            "type": "text"
+          },
+          {
+            "field": "b16",
+            "label": "Batch 16",
+            "type": "text"
+          },
+          {
+            "field": "b32",
+            "label": "Batch 32",
+            "type": "text"
+          },
+          {
+            "field": "b64",
+            "label": "Batch 64",
+            "type": "text"
+          },
+          {
+            "field": "b128",
+            "label": "Batch 128",
+            "type": "text"
+          }
+        ],
+        "defaultSort": {
+          "field": "parameter_count",
+          "direction": "asc"
+        }
+      }
+    ],
+    "sources": [
+      {
+        "id": "compiled_memory_measurements",
+        "label": "JAX/XLA CPU compiled-memory measurements",
+        "path": "memory_estimate_report/memory_estimates.csv"
+      },
+      {
+        "id": "model_implementation",
+        "label": "Transformer implementation and presets",
+        "path": "transformer.py"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "layout": "full",
+        "body": "# Transformer training-memory estimate"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "compiled_memory_measurements",
+        "body": "## Technical summary\n\nBlockwise attention materially changes the fit envelope. At batch 1, the compiler estimate falls from **1.671 to 0.065 GiB (25.8\u00d7)** for the 200k preset and from **6.281 to 1.853 GiB (3.4\u00d7)** for the 38m preset. The gain is largest in small models, where the old 2048\u00d72048 attention matrices dominated nearly everything else.\n\nThe improvement does not make large batches cheap: the current 38m preset is **22.79 GiB at batch 16** and **176.35 GiB at batch 128** before process overhead."
+      },
+      {
+        "id": "comparison_intro",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## Previous versus current footprint\n\nEach cell is **previous dense \u2192 current blockwise**. GiB means 2\u00b3\u2070 bytes. Previous batches 1, 4, and 16 and every current value are direct compiler estimates; the \u2248 values are linear extrapolations for the old implementation."
+      },
+      {
+        "id": "comparison_table",
+        "type": "table",
+        "layout": "full",
+        "tableId": "memory_matrix"
+      },
+      {
+        "id": "savings_intro",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## Where blockwise attention helps most\n\nAt batch 1 the reduction ranges from 25.8\u00d7 for 200k to 3.4\u00d7 for 38m. As the model grows, parameter, optimizer-state, and feed-forward memory occupy more of the total, so removing the quadratic attention materialization has a smaller\u2014but still substantial\u2014relative effect."
+      },
+      {
+        "id": "savings_chart",
+        "type": "chart",
+        "layout": "full",
+        "chartId": "batch1_reduction"
+      },
+      {
+        "id": "scope",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## Scope and metric definition\n\nThis is a **training-step buffer estimate**, not whole-process RSS. The compiled target is `_update_parameters` with a uint8 `[batch, 2048]` batch, vocabulary 256, FP32 parameters/activations, Adam state, no gradient clipping, no donated arguments, and the current 128-token attention blocks.\n\nThe reported total is `argument + output + temporary \u2212 alias` bytes. Alias was zero in every current compilation. Because arguments are not donated, both incoming and returned parameter/Adam trees can be live in the estimate."
+      },
+      {
+        "id": "methodology",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## Methodology\n\nAll 30 current configurations were lowered and compiled on the CPU backend and read through `CompiledMemoryStats`; they were not executed. The previous dense-attention code was compiled at batches 1, 4, and 16. For batches 32, 64, and 128, the old total uses the affine slope between batches 4 and 16. A batch-8 spot check missed that fit by less than 0.001 GiB."
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## Limitations and robustness\n\nXLA memory analysis is backend- and version-specific and is intended as an estimate. It excludes Python/JAX runtime RSS, compiler working memory, allocator caching and fragmentation, executable/constants that the report does not expose, host copies, OS/library overhead, and the roughly 100 MB eager dataset. The old Python attention path also constructed large float64 causal masks while tracing; that tracing spike is not added to the table because XLA can fold or broadcast those constants differently. Actual peak RSS should therefore be measured before setting a hard machine-size limit."
+      },
+      {
+        "id": "recommendations",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## Practical sizing and next steps\n\nFor an initial CPU capacity check, budget roughly **1.25\u00d7 the current table + 2 GiB** of available RAM, then validate with process-level peak RSS. On a 32 GiB machine this suggests 200k/800k through batch 128, 3.2m through batch 64, 6.4m through batch 32, and 38m at batch 4 comfortably; 38m batch 16 is possible by the buffer estimate but leaves little compiler/runtime headroom.\n\nThe next low-risk memory experiment is argument donation for the parameter and optimizer-state trees. It could remove up to one incoming state copy\u2014about 436 MiB for 38m\u2014but requires checking call-site ownership and recompilation behavior."
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## Further questions\n\nThe useful follow-up is to record peak RSS for one small and one large preset, including first-step compilation and steady-state steps. That will calibrate the headroom rule and show whether compiler memory, buffer memory, or dataset/runtime overhead is now the practical constraint."
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-07-18T23:25:42Z",
+    "status": "ready",
+    "datasets": {
+      "comparison_matrix": [
+        {
+          "preset": "200k",
+          "parameter_count": 231936,
+          "b1": "1.67 \u2192 0.065",
+          "b4": "6.24 \u2192 0.257",
+          "b16": "24.93 \u2192 1.02",
+          "b32": "\u224849.85 \u2192 2.03",
+          "b64": "\u224899.70 \u2192 4.05",
+          "b128": "\u2248199.39 \u2192 8.09"
+        },
+        {
+          "preset": "800k",
+          "parameter_count": 856832,
+          "b1": "1.72 \u2192 0.132",
+          "b4": "6.45 \u2192 0.500",
+          "b16": "25.76 \u2192 1.94",
+          "b32": "\u224851.50 \u2192 3.87",
+          "b64": "\u2248102.98 \u2192 7.72",
+          "b128": "\u2248205.95 \u2192 15.42"
+        },
+        {
+          "preset": "3.2m",
+          "parameter_count": 3286272,
+          "b1": "1.86 \u2192 0.294",
+          "b4": "6.92 \u2192 1.01",
+          "b16": "27.45 \u2192 3.82",
+          "b32": "\u224854.83 \u2192 7.57",
+          "b64": "\u2248109.58 \u2192 15.08",
+          "b128": "\u2248219.09 \u2192 30.08"
+        },
+        {
+          "preset": "6.4m",
+          "parameter_count": 6441216,
+          "b1": "3.61 \u2192 0.576",
+          "b4": "13.80 \u2192 1.99",
+          "b16": "54.77 \u2192 7.52",
+          "b32": "\u2248109.40 \u2192 14.89",
+          "b64": "\u2248218.65 \u2192 29.65",
+          "b128": "\u2248437.16 \u2192 59.15"
+        },
+        {
+          "preset": "38m",
+          "parameter_count": 38066432,
+          "b1": "6.28 \u2192 1.85",
+          "b4": "23.77 \u2192 6.34",
+          "b16": "92.54 \u2192 22.79",
+          "b32": "\u2248184.23 \u2192 44.73",
+          "b64": "\u2248367.60 \u2192 88.60",
+          "b128": "\u2248734.35 \u2192 176.35"
+        }
+      ],
+      "batch1_savings": [
+        {
+          "preset": "200k",
+          "parameter_count": 231936,
+          "reduction_ratio": 25.798,
+          "previous_gib": 1.671,
+          "current_gib": 0.065
+        },
+        {
+          "preset": "800k",
+          "parameter_count": 856832,
+          "reduction_ratio": 13.016,
+          "previous_gib": 1.724,
+          "current_gib": 0.132
+        },
+        {
+          "preset": "3.2m",
+          "parameter_count": 3286272,
+          "reduction_ratio": 6.311,
+          "previous_gib": 1.857,
+          "current_gib": 0.294
+        },
+        {
+          "preset": "6.4m",
+          "parameter_count": 6441216,
+          "reduction_ratio": 6.279,
+          "previous_gib": 3.615,
+          "current_gib": 0.576
+        },
+        {
+          "preset": "38m",
+          "parameter_count": 38066432,
+          "reduction_ratio": 3.39,
+          "previous_gib": 6.281,
+          "current_gib": 1.853
+        }
+      ],
+      "current_batch128": [
+        {
+          "preset": "200k",
+          "parameter_count": 231936,
+          "current_gib": 8.092,
+          "suggested_available_ram_gib": 12.1
+        },
+        {
+          "preset": "800k",
+          "parameter_count": 856832,
+          "current_gib": 15.419,
+          "suggested_available_ram_gib": 21.3
+        },
+        {
+          "preset": "3.2m",
+          "parameter_count": 3286272,
+          "current_gib": 30.082,
+          "suggested_available_ram_gib": 39.6
+        },
+        {
+          "preset": "6.4m",
+          "parameter_count": 6441216,
+          "current_gib": 59.154,
+          "suggested_available_ram_gib": 75.9
+        },
+        {
+          "preset": "38m",
+          "parameter_count": 38066432,
+          "current_gib": 176.351,
+          "suggested_available_ram_gib": 222.4
+        }
+      ]
+    },
+    "accessIssues": []
+  },
+  "sources": [
+    {
+      "id": "compiled_memory_measurements",
+      "label": "JAX/XLA CPU compiled-memory measurements",
+      "path": "memory_estimate_report/memory_estimates.csv",
+      "query": {
+        "engine": "JAX/XLA CPU 0.10.2",
+        "language": "sql",
+        "sql": "SELECT preset, parameter_count, batch_size, previous_total_gib, previous_measurement, current_total_gib, reduction_ratio\nFROM read_csv_auto('memory_estimate_report/memory_estimates.csv')\nORDER BY parameter_count, batch_size",
+        "description": "Compile-only estimates for uint8 [batch, 2048] inputs, FP32 model state, and Adam. Current values are compiled at every batch size. Previous values are compiled at batches 1, 4, and 16; batches 32-128 use the validated affine batch scaling from batches 4-16.",
+        "executed_at": "2026-07-18T23:25:42Z"
+      }
+    },
+    {
+      "id": "model_implementation",
+      "label": "Transformer implementation and presets",
+      "path": "transformer.py",
+      "query": {
+        "engine": "local source",
+        "language": "sql",
+        "sql": "SELECT content FROM read_text('transformer.py')",
+        "description": "Defines the five model presets, FP32 defaults, causal self-attention, and the current 128-token query/key block size.",
+        "executed_at": "2026-07-18T23:25:42Z"
+      }
+    }
+  ]
+}
