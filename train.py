@@ -646,7 +646,16 @@ def train_transformer_decoder(
   convergence_loss_window: list[Any] = []
   last_loss = 0.0
   stopped_for_convergence = False
-  for step in tqdm.trange(training_steps, disable=not use_tqdm):
+
+  progress_bar = tqdm.trange(training_steps, disable=not use_tqdm)
+
+  def log_progress(message: str, *args: Any) -> None:
+    if use_tqdm:
+      progress_bar.write(message % args, file=progress_bar.fp)
+    else:
+      logging.info(message, *args, stacklevel=2)
+
+  for step in progress_bar:
     batch = fetch_random_batch()
     should_log = log_every > 0 and step % log_every == 0
 
@@ -663,7 +672,7 @@ def train_transformer_decoder(
       nats_per_byte, bits_per_byte, perplexity = _loss_statistics(
           logs['loss'], sequence_length
       )
-      logging.info(
+      log_progress(
           'Step %d, loss %.6f, nats/byte %.6f, bits/byte %.6f, '
           'perplexity %.3f, grad norm %.6f',
           step,
@@ -683,7 +692,7 @@ def train_transformer_decoder(
         ) / sequence_length
         convergence_loss_window.clear()
         converged = convergence_monitor.update(window_mean_loss)
-        logging.info(
+        log_progress(
             'Convergence check after %d steps: mean nats/byte %.6f, '
             'best %.6f, windows without improvement %d/%d',
             step + 1,
@@ -693,7 +702,7 @@ def train_transformer_decoder(
             convergence_patience,
         )
         if converged:
-          logging.info(
+          log_progress(
               'Stopping early after %d steps because loss did not improve by '
               'at least %g nats/byte for %d windows.',
               step + 1,
