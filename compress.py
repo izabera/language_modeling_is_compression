@@ -55,6 +55,22 @@ _MODEL_PATH = flags.DEFINE_string(
 )
 
 
+def _compression_ratio(
+    raw_length: int,
+    compressed_length: int,
+    num_chunks: int,
+    num_missed_bits: int,
+    header_length: int,
+) -> float:
+  """Returns the adjusted ratio for the chunks compressed so far."""
+  if num_missed_bits:
+    num_bits = 8 * raw_length
+    compressed_length *= num_bits / (num_bits - num_missed_bits)
+
+  compressed_length -= header_length * (num_chunks - 1)
+  return compressed_length / raw_length
+
+
 def evaluate_compressor_chunked(
     compress_fn: compressor.Compressor,
     get_data_generator_fn: Callable[[], Generator[bytes, None, None]],
@@ -81,12 +97,20 @@ def evaluate_compressor_chunked(
     The compression rate and the total running time.
   """
   num_missed_bits = running_time = raw_length = compressed_length = 0
+  num_processed_chunks = 0
+
+  header_length = 0
+  if count_header_only_once:
+    header_length = len(compress_fn((0).to_bytes(1, 'little')))
 
   data_generator = get_data_generator_fn()
+  progress_bar = None
   if use_tqdm:
-    data_generator = tqdm.tqdm(data_generator, total=num_chunks)
+    progress_bar = tqdm.tqdm(data_generator, total=num_chunks)
+    data_generator = progress_bar
 
   for data in data_generator:
+    num_processed_chunks += 1
     if mask_fn is not None:
       data, missed_bits = mask_fn(data)
       num_missed_bits += missed_bits
@@ -99,21 +123,26 @@ def evaluate_compressor_chunked(
     raw_length += len(data)
     compressed_length += len(compressed_data)
 
-  # Since language models are trained on ASCII strings, they cannot handle all
-  # byte values. Thus, we mask the data to be ASCII-decodable by zeroing
-  # `num_missed_bits` of the most significant bits. However, this means that we
-  # are effectively only compressing `num_bits - num_missed_bits` bits, so we
-  # rescale the `compressed_length` to account for this.
-  if mask_fn is not None:
-    num_bits = 8 * num_chunks * constants.CHUNK_SIZE_BYTES
-    compressed_length *= num_bits / (num_bits - num_missed_bits)
+    if progress_bar is not None:
+      ratio = _compression_ratio(
+          raw_length=raw_length,
+          compressed_length=compressed_length,
+          num_chunks=num_processed_chunks,
+          num_missed_bits=num_missed_bits,
+          header_length=header_length,
+      )
+      progress_bar.set_postfix(
+          {'ratio': f'{100 * ratio:.1f}%'}, refresh=False
+      )
 
-  # We only count the header once for classical compressors.
-  if count_header_only_once:
-    header_length = len(compress_fn((0).to_bytes(1, 'little')))
-    compressed_length -= header_length * (num_chunks - 1)
-
-  return compressed_length / raw_length, running_time
+  ratio = _compression_ratio(
+      raw_length=raw_length,
+      compressed_length=compressed_length,
+      num_chunks=num_processed_chunks,
+      num_missed_bits=num_missed_bits,
+      header_length=header_length,
+  )
+  return ratio, running_time
 
 
 def evaluate_compressor_unchunked(
