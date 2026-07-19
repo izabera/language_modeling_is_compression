@@ -15,12 +15,17 @@
 
 """Trains a language model on the Enwik8 dataset."""
 
+from collections.abc import Callable
+from collections.abc import Iterator
+import contextlib
 import dataclasses
 import functools
 import math
 import os
 import pathlib
 import random
+import signal
+import threading
 from typing import Any
 
 from absl import app
@@ -151,6 +156,49 @@ _OUTPUT_PATH = flags.DEFINE_string(
 _USE_TQDM = flags.DEFINE_bool(
     'use_tqdm', True, 'Show a progress bar during training.'
 )
+
+
+@dataclasses.dataclass
+class _InterruptState:
+  """Records whether the CLI received a graceful interrupt request."""
+
+  requested: bool = False
+
+
+class _TrainingInterrupted(Exception):
+  """Carries the last safely completed training state to the CLI."""
+
+  def __init__(
+      self,
+      params: hk.Params | None,
+      loss: Any | None,
+      completed_steps: int,
+  ):
+    super().__init__('Training interrupted at a safe update boundary.')
+    self.params = params
+    self.loss = loss
+    self.completed_steps = completed_steps
+
+
+@contextlib.contextmanager
+def _graceful_sigint() -> Iterator[_InterruptState]:
+  """Makes the first SIGINT cooperative and the second one immediate."""
+  state = _InterruptState()
+  if threading.current_thread() is not threading.main_thread():
+    yield state
+    return
+
+  def request_stop(_signal_number: int, _frame: Any) -> None:
+    state.requested = True
+    # Once the first request has reached Python, a second Ctrl-C must also work
+    # if execution returns to an uninterruptible backend call.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+  previous_handler = signal.signal(signal.SIGINT, request_stop)
+  try:
+    yield state
+  finally:
+    signal.signal(signal.SIGINT, previous_handler)
 
 
 def _make_optimizer(
@@ -504,6 +552,7 @@ def train_transformer_decoder(
     convergence_patience: int = 0,
     convergence_min_delta: float = 1e-4,
     convergence_window: int = 100,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> tuple[hk.Params, float]:
   """Trains a language model on Enwik8 data.
 
@@ -533,9 +582,16 @@ def train_transformer_decoder(
       improvement for convergence stopping.
     convergence_window: Number of consecutive batch losses averaged for each
       convergence check.
+    stop_requested: Optional cooperative-stop predicate. When it becomes true,
+      training stops only after the active donated-buffer update is safe to
+      checkpoint.
 
   Returns:
     The final parameters and loss.
+
+  Raises:
+    _TrainingInterrupted: The cooperative stop predicate requested a stop. The
+      exception carries the last state known to be safe for checkpointing.
   """
   config = model_config or transformer.TransformerConfig(
       vocab_size=constants.ALPHABET_SIZE
@@ -655,62 +711,92 @@ def train_transformer_decoder(
     else:
       logging.info(message, *args, stacklevel=2)
 
-  for step in progress_bar:
-    batch = fetch_random_batch()
-    should_log = log_every > 0 and step % log_every == 0
+  completed_steps = 0
 
-    params, opt_state, logs = _update_parameters(
-        params=params,
-        opt_state=opt_state,
-        sequences=batch,
-        grad_fn=grad_fn,
-        optimizer=optimizer,
-        normalize_gradients=normalize_gradients,
-        compute_grad_norm=should_log,
-    )
-    if should_log:
-      nats_per_byte, bits_per_byte, perplexity = _loss_statistics(
-          logs['loss'], sequence_length
-      )
+  def raise_if_interrupted() -> None:
+    if stop_requested is None or not stop_requested():
+      return
+    if completed_steps == 0:
       log_progress(
-          'Step %d, loss %.6f, nats/byte %.6f, bits/byte %.6f, '
-          'perplexity %.3f, grad norm %.6f',
-          step,
-          logs['loss'],
-          nats_per_byte,
-          bits_per_byte,
-          perplexity,
-          logs['grad_norm_unclipped'],
+          'Interrupt received before the first training step completed.'
       )
-    last_loss = logs['loss']
+      raise _TrainingInterrupted(None, None, completed_steps)
 
-    if convergence_monitor is not None:
-      convergence_loss_window.append(logs['loss'])
-      if len(convergence_loss_window) == convergence_window:
-        window_mean_loss = float(
-            jax.device_get(jnp.mean(jnp.stack(convergence_loss_window)))
-        ) / sequence_length
-        convergence_loss_window.clear()
-        converged = convergence_monitor.update(window_mean_loss)
-        log_progress(
-            'Convergence check after %d steps: mean nats/byte %.6f, '
-            'best %.6f, windows without improvement %d/%d',
-            step + 1,
-            window_mean_loss,
-            convergence_monitor.best_mean_loss,
-            convergence_monitor.windows_without_improvement,
-            convergence_patience,
+    # The newly assigned values, rather than the donated inputs from the
+    # previous step, are the only state that is safe to preserve.
+    jax.block_until_ready((params, opt_state, last_loss))
+    log_progress(
+        'Interrupt received at a safe boundary (completed steps: %d). '
+        'Press Ctrl-C again to abort immediately.',
+        completed_steps,
+    )
+    raise _TrainingInterrupted(params, last_loss, completed_steps)
+
+  try:
+    for step in progress_bar:
+      raise_if_interrupted()
+      batch = fetch_random_batch()
+      should_log = log_every > 0 and step % log_every == 0
+
+      params, opt_state, logs = _update_parameters(
+          params=params,
+          opt_state=opt_state,
+          sequences=batch,
+          grad_fn=grad_fn,
+          optimizer=optimizer,
+          normalize_gradients=normalize_gradients,
+          compute_grad_norm=should_log,
+      )
+      last_loss = logs['loss']
+      completed_steps += 1
+      raise_if_interrupted()
+
+      if should_log:
+        nats_per_byte, bits_per_byte, perplexity = _loss_statistics(
+            logs['loss'], sequence_length
         )
-        if converged:
+        log_progress(
+            'Step %d, loss %.6f, nats/byte %.6f, bits/byte %.6f, '
+            'perplexity %.3f, grad norm %.6f',
+            step,
+            logs['loss'],
+            nats_per_byte,
+            bits_per_byte,
+            perplexity,
+            logs['grad_norm_unclipped'],
+        )
+
+      if convergence_monitor is not None:
+        convergence_loss_window.append(logs['loss'])
+        if len(convergence_loss_window) == convergence_window:
+          window_mean_loss = float(
+              jax.device_get(jnp.mean(jnp.stack(convergence_loss_window)))
+          ) / sequence_length
+          convergence_loss_window.clear()
+          converged = convergence_monitor.update(window_mean_loss)
           log_progress(
-              'Stopping early after %d steps because loss did not improve by '
-              'at least %g nats/byte for %d windows.',
+              'Convergence check after %d steps: mean nats/byte %.6f, '
+              'best %.6f, windows without improvement %d/%d',
               step + 1,
-              convergence_min_delta,
+              window_mean_loss,
+              convergence_monitor.best_mean_loss,
+              convergence_monitor.windows_without_improvement,
               convergence_patience,
           )
-          stopped_for_convergence = True
-          break
+          if converged:
+            log_progress(
+                'Stopping early after %d steps because loss did not improve by '
+                'at least %g nats/byte for %d windows.',
+                step + 1,
+                convergence_min_delta,
+                convergence_patience,
+            )
+            stopped_for_convergence = True
+            break
+
+    raise_if_interrupted()
+  finally:
+    progress_bar.close()
 
   if convergence_monitor is not None and not stopped_for_convergence:
     logging.info(
@@ -761,39 +847,65 @@ def main(argv: list[str]) -> None:
   except ValueError as exc:
     raise app.UsageError(str(exc)) from exc
 
-  params, loss = train_transformer_decoder(
-      training_steps=_TRAINING_STEPS.value,
-      log_every=_LOG_EVERY.value,
-      sequence_length=_SEQUENCE_LENGTH.value,
-      batch_size=_BATCH_SIZE.value,
-      model_config=config,
-      seed=_SEED.value,
-      learning_rate=_LEARNING_RATE.value,
-      optimizer_name=_OPTIMIZER.value,
-      momentum=_MOMENTUM.value,
-      weight_decay=_WEIGHT_DECAY.value,
-      gradient_clip_norm=_GRADIENT_CLIP_NORM.value,
-      normalize_gradients=_NORMALIZE_GRADIENTS.value,
-      convergence_patience=_CONVERGENCE_PATIENCE.value,
-      convergence_min_delta=_CONVERGENCE_MIN_DELTA.value,
-      convergence_window=_CONVERGENCE_WINDOW.value,
-      use_tqdm=_USE_TQDM.value,
-  )
+  interrupted = False
+  with _graceful_sigint() as interrupt_state:
+    try:
+      params, loss = train_transformer_decoder(
+          training_steps=_TRAINING_STEPS.value,
+          log_every=_LOG_EVERY.value,
+          sequence_length=_SEQUENCE_LENGTH.value,
+          batch_size=_BATCH_SIZE.value,
+          model_config=config,
+          seed=_SEED.value,
+          learning_rate=_LEARNING_RATE.value,
+          optimizer_name=_OPTIMIZER.value,
+          momentum=_MOMENTUM.value,
+          weight_decay=_WEIGHT_DECAY.value,
+          gradient_clip_norm=_GRADIENT_CLIP_NORM.value,
+          normalize_gradients=_NORMALIZE_GRADIENTS.value,
+          convergence_patience=_CONVERGENCE_PATIENCE.value,
+          convergence_min_delta=_CONVERGENCE_MIN_DELTA.value,
+          convergence_window=_CONVERGENCE_WINDOW.value,
+          use_tqdm=_USE_TQDM.value,
+          stop_requested=lambda: interrupt_state.requested,
+      )
+    except _TrainingInterrupted as exc:
+      interrupted = True
+      params = exc.params
+      loss = exc.loss
 
-  nats_per_byte, bits_per_byte, perplexity = _loss_statistics(
-      loss, _SEQUENCE_LENGTH.value
-  )
-  logging.info(
-      'Final loss: %.6f, nats/byte: %.6f, bits/byte: %.6f, '
-      'perplexity: %.3f',
-      loss,
-      nats_per_byte,
-      bits_per_byte,
-      perplexity,
-  )
+    if params is None:
+      logging.warning(
+          'No training step completed; the existing checkpoint was left '
+          'unchanged.'
+      )
+    else:
+      if loss is None:
+        raise RuntimeError('Completed training state did not include a loss.')
+      params, loss = jax.device_get((params, loss))
+      loss = float(loss)
+      interrupted = interrupted or interrupt_state.requested
 
-  model_checkpoint.save(_OUTPUT_PATH.value, params, config)
-  logging.info('Model checkpoint saved to %s', _OUTPUT_PATH.value)
+      nats_per_byte, bits_per_byte, perplexity = _loss_statistics(
+          loss, _SEQUENCE_LENGTH.value
+      )
+      logging.info(
+          '%s loss: %.6f, nats/byte: %.6f, bits/byte: %.6f, '
+          'perplexity: %.3f',
+          'Last completed' if interrupted else 'Final',
+          loss,
+          nats_per_byte,
+          bits_per_byte,
+          perplexity,
+      )
+
+      model_checkpoint.save(_OUTPUT_PATH.value, params, config)
+      logging.info('Model checkpoint saved to %s', _OUTPUT_PATH.value)
+
+    interrupted = interrupted or interrupt_state.requested
+
+  if interrupted or interrupt_state.requested:
+    raise SystemExit(128 + signal.SIGINT)
 
 
 if __name__ == '__main__':

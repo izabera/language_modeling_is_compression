@@ -3,6 +3,7 @@
 import dataclasses
 import json
 import os
+import tempfile
 
 import haiku as hk
 import numpy as np
@@ -20,14 +21,36 @@ def save(
 ) -> None:
   """Saves model parameters and the config required to use them."""
   serialized_config = json.dumps(dataclasses.asdict(config), sort_keys=True)
-  # Passing a file handle prevents numpy from silently appending ".npz" when a
-  # caller deliberately chooses a different checkpoint suffix.
-  with open(path, 'wb') as checkpoint_file:
-    np.savez(
-        checkpoint_file,
-        **params,
-        **{_CONFIG_KEY: np.asarray(serialized_config)},
-    )
+  path = os.fspath(path)
+  directory = os.path.dirname(path) or '.'
+  temporary_path: str | None = None
+  try:
+    # Keeping the temporary file beside the checkpoint makes os.replace atomic.
+    # Passing a file handle also prevents numpy from silently appending ".npz"
+    # when a caller deliberately chooses a different checkpoint suffix.
+    with tempfile.NamedTemporaryFile(
+        mode='wb',
+        dir=directory,
+        prefix='.checkpoint-',
+        suffix='.tmp',
+        delete=False,
+    ) as checkpoint_file:
+      temporary_path = checkpoint_file.name
+      np.savez(
+          checkpoint_file,
+          **params,
+          **{_CONFIG_KEY: np.asarray(serialized_config)},
+      )
+      checkpoint_file.flush()
+      os.fsync(checkpoint_file.fileno())
+    os.replace(temporary_path, path)
+    temporary_path = None
+  finally:
+    if temporary_path is not None:
+      try:
+        os.unlink(temporary_path)
+      except FileNotFoundError:
+        pass
 
 
 def load(
