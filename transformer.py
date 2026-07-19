@@ -54,7 +54,7 @@ class TransformerConfig:
 # preset continues the family's width doubling (64 -> 128 -> 256 -> 512) at
 # twelve layers: its non-embedding parameter count (37,804,032) rounds to the
 # paper's label exactly as the smaller presets' counts round to theirs
-# (198,912 / 791,040 / 3,154,944 / 6,309,888).rs.
+# (198,912 / 791,040 / 3,154,944 / 6,309,888).
 MODEL_SIZE_PRESETS: Mapping[str, Mapping[str, int]] = {
     '200k': {
         'embedding_dim': 64,

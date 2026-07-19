@@ -138,7 +138,11 @@ specify four heads for the 200K and 800K experiments as well as rotary
 positional encodings, whereas this repository implements fixed sinusoidal
 encodings. Use `--num_heads=4` for the paper's small-model head count. The
 `6.4m` preset is the natural eight-layer extension of the four-layer `3.2m`
-configuration.
+configuration. The `38m` preset continues the family's width doubling at
+twelve layers; the paper's size labels track the non-embedding parameter
+counts (198,912 / 791,040 / 3,154,944 / 6,309,888 / 37,804,032), and 512
+dimensions with twelve layers is the only standard shape whose count rounds
+to 38M.
 
 The default batch size is 1 to keep memory use modest. Checkpoints include the
 model configuration, so non-default model sizes can be loaded for compression.
