@@ -46,7 +46,14 @@ def load(
       # dense operation order, which can affect arithmetic-coded bitstreams at
       # floating-point rounding boundaries.
       config_values.setdefault('attention_block_size', None)
+      # The former byte-level decoder is exactly the group-size-one case. Its
+      # parameter names and shapes remain valid under that configuration.
+      config_values.setdefault('byte_group_size', 1)
       config = transformer.TransformerConfig(**config_values)
     else:
-      config = dataclasses.replace(default_config, attention_block_size=None)
+      config = dataclasses.replace(
+          default_config,
+          attention_block_size=None,
+          byte_group_size=1,
+      )
   return params, config

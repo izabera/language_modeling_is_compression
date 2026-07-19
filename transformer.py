@@ -33,6 +33,11 @@ class TransformerConfig:
   vocab_size: int
   # The dimension of the first embedding.
   embedding_dim: int = 64
+  # Number of adjacent history bytes concatenated into each attention token.
+  # Following TRACE, each byte is embedded at `embedding_dim / group_size`, so
+  # concatenation preserves the Transformer's hidden width. Target-aligned
+  # grouping phases keep every output strictly autoregressive.
+  byte_group_size: int = 4
   # The number of multi-head attention layers.
   num_layers: int = 4
   # The number of heads per layer.
@@ -43,7 +48,8 @@ class TransformerConfig:
   # compared to the `embedding_dim`.
   widening_factor: int = 4
   # Size of the query and key tiles used by the exact blockwise attention
-  # implementation. Set to None to use the legacy dense attention path.
+  # implementation, measured in byte-equivalent positions. The grouped
+  # decoder divides this by `byte_group_size`. Set to None for dense attention.
   attention_block_size: int | None = 256
 
 
@@ -107,14 +113,34 @@ def config_for_model_size(
 def parameter_count(config: TransformerConfig) -> int:
   """Returns the exact number of trainable parameters for this architecture."""
   dim = config.embedding_dim
+  group_size = config.byte_group_size
+  if group_size <= 0 or dim % group_size:
+    raise ValueError(
+        'byte_group_size must be positive and divide embedding_dim; got '
+        f'{group_size} and {dim}.'
+    )
   widening = config.widening_factor
   parameters_per_layer = (
       (4 + 2 * widening) * dim**2 + (widening + 5) * dim
   )
   return (
-      2 * config.vocab_size * dim
+      config.vocab_size * (dim // group_size)
+      + config.vocab_size * dim
       + config.vocab_size
       + config.num_layers * parameters_per_layer
+  )
+
+
+def attention_block_size_in_group_tokens(
+    config: TransformerConfig,
+) -> int | None:
+  """Converts the byte-equivalent tile budget to grouped token positions."""
+  if config.attention_block_size is None:
+    return None
+  return max(
+      1,
+      (config.attention_block_size + config.byte_group_size - 1)
+      // config.byte_group_size,
   )
 
 
@@ -469,14 +495,26 @@ class MultiHeadDotProductAttention(hk.Module):
     q = hk.Linear(num_hiddens, with_bias=False)(inputs_q)
     k = hk.Linear(num_hiddens, with_bias=False)(inputs_kv)
     v = hk.Linear(num_hiddens, with_bias=False)(inputs_kv)
-    # The second (sequence) dimension is undefined since it can differ between
-    # queries and keys/values when decoding. Also checking that the inputs have
-    # the same batch size as the reshape below does not guarantee a failure if
-    # they are different.
-    new_shape = (batch_size, -1, self._num_heads, self._num_hiddens_per_head)
-    q = jnp.reshape(q, new_shape)
-    k = jnp.reshape(k, new_shape)
-    v = jnp.reshape(v, new_shape)
+    # Keep query and key/value sequence lengths explicit. Besides supporting
+    # cross-attention, this avoids an ambiguous inferred dimension for empty
+    # sequences.
+    q = jnp.reshape(
+        q,
+        (
+            batch_size,
+            inputs_q.shape[1],
+            self._num_heads,
+            self._num_hiddens_per_head,
+        ),
+    )
+    kv_shape = (
+        batch_size,
+        inputs_kv.shape[1],
+        self._num_heads,
+        self._num_hiddens_per_head,
+    )
+    k = jnp.reshape(k, kv_shape)
+    v = jnp.reshape(v, kv_shape)
 
     if self._attention_block_size is None:
       if is_causal:
@@ -535,27 +573,121 @@ def sinusoid_position_encoding(
   return embeddings[:, :hidden_size]
 
 
-def embed_sequences(
-    sequences: jax.Array,
+def _group_previous_bytes(
+    targets: jax.Array,
+    group_size: int,
+) -> jax.Array:
+  """Builds target-aligned groups of preceding bytes.
+
+  TRACE predicts one byte from a window whose adjacent history bytes are
+  concatenated in groups. A single fixed grouping of a complete target
+  sequence would either leak later bytes within a group or predict all bytes
+  in a group from an unnecessarily stale context. Instead, target positions
+  with the same residue modulo `group_size` form an independent causal phase.
+
+  For target position `t = phase + group_index * group_size`, the token at
+  `group_index` contains exactly
+  `[x[t - group_size], ..., x[t - 1]]`. Negative positions are represented by
+  zero-valued beginning-of-sequence padding. The result's phase dimension can
+  be folded into the batch dimension before attention.
+
+  Args:
+    targets: Integer target values with shape [B, T].
+    group_size: Number of adjacent history bytes in each group.
+
+  Returns:
+    Integer byte groups with shape [B, group_size, ceil(T / group_size),
+    group_size].
+  """
+  batch_size, sequence_length = targets.shape
+  num_group_positions = (sequence_length + group_size - 1) // group_size
+  if sequence_length == 0:
+    return jnp.zeros(
+        (batch_size, group_size, 0, group_size), dtype=targets.dtype
+    )
+
+  phases = jnp.arange(group_size, dtype=jnp.int32)[:, None, None]
+  group_indices = jnp.arange(
+      num_group_positions, dtype=jnp.int32
+  )[None, :, None]
+  byte_offsets = jnp.arange(group_size, dtype=jnp.int32)[None, None, :]
+  target_positions = phases + group_indices * group_size
+  history_positions = target_positions - group_size + byte_offsets
+  valid_history = jnp.logical_and(
+      history_positions >= 0, history_positions < sequence_length
+  )
+  safe_history_positions = jnp.clip(
+      history_positions, min=0, max=sequence_length - 1
+  )
+  history = jnp.take(targets, safe_history_positions, axis=1)
+  return jnp.where(valid_history[None, ...], history, 0)
+
+
+def embed_grouped_history(
+    targets: jax.Array,
     config: TransformerConfig,
 ) -> jax.Array:
-  """Returns embeddings for sequences of tokens."""
+  """Embeds target-aligned byte groups for causal attention.
+
+  Returns an array shaped [B * G, ceil(T / G), D], where G is the byte group
+  size and D is the Transformer width. Folding grouping phases into the batch
+  dimension lets all target bytes be trained in parallel while sharing one
+  Transformer and one output head.
+  """
+  batch_size, sequence_length = targets.shape
+  group_size = config.byte_group_size
+  embedding_size = config.embedding_dim
+  if group_size <= 0 or embedding_size % group_size:
+    raise ValueError(
+        'byte_group_size must be positive and divide embedding_dim; got '
+        f'{group_size} and {embedding_size}.'
+    )
+
+  byte_embedding_size = embedding_size // group_size
   embs_init = hk.initializers.TruncatedNormal(stddev=config.emb_init_scale)
   embeddings_layer = hk.Embed(
       vocab_size=config.vocab_size,
-      embed_dim=config.embedding_dim,
+      embed_dim=byte_embedding_size,
       lookup_style=hk.EmbedLookupStyle.ARRAY_INDEX,
       w_init=embs_init,
   )
-  embeddings = embeddings_layer(sequences)
-  embeddings *= jnp.sqrt(config.embedding_dim)
+  grouped_history = _group_previous_bytes(targets, group_size)
+  embeddings = embeddings_layer(grouped_history)
+  embeddings *= jnp.sqrt(embedding_size)
 
-  _, sequence_length, embedding_size = embeddings.shape
-  pos_encodings = sinusoid_position_encoding(
-      sequence_length=sequence_length,
+  num_group_positions = grouped_history.shape[2]
+  embeddings = jnp.reshape(
+      embeddings,
+      (
+          batch_size,
+          group_size,
+          num_group_positions,
+          embedding_size,
+      ),
+  )
+
+  # Preserve byte-level absolute positions: phase r, group position k predicts
+  # byte r + kG. This reduces exactly to the original positional encoding when
+  # G=1 and is invariant to how much future context is present in a call.
+  padded_sequence_length = num_group_positions * group_size
+  all_pos_encodings = sinusoid_position_encoding(
+      sequence_length=padded_sequence_length,
       hidden_size=embedding_size,
   )
-  return embeddings + pos_encodings
+  target_positions = (
+      np.arange(group_size)[:, None]
+      + group_size * np.arange(num_group_positions)[None, :]
+  )
+  pos_encodings = all_pos_encodings[target_positions]
+  embeddings = embeddings + pos_encodings[None, ...]
+  return jnp.reshape(
+      embeddings,
+      (
+          batch_size * group_size,
+          num_group_positions,
+          embedding_size,
+      ),
+  )
 
 
 def layer_norm(x: jax.Array) -> jax.Array:
@@ -580,26 +712,33 @@ def transformer_decoder(
     targets: The integer target values, shape [B, T].
     config: The config to use for the transformer.
   """
-  # Right shift the targets to get the inputs (the first token is now a 0).
-  inputs = shift_right(targets)
+  batch_size, sequence_length = targets.shape
 
-  # Embeds the inputs and adds positional encodings.
-  embeddings = embed_sequences(inputs, config)
+  # Embed G-byte history groups in G target-aligned phases. Attention sees
+  # ceil(T / G) positions per phase rather than T byte positions.
+  embeddings = embed_grouped_history(targets, config)
 
   causal_mask = None
   if config.attention_block_size is None:
-    batch_size, sequence_length = embeddings.shape[:2]
+    attention_batch_size, attention_length = embeddings.shape[:2]
     # Preserve the released dense operation for old checkpoints.
     causal_mask = np.tril(
-        np.ones((batch_size, 1, sequence_length, sequence_length))
+        np.ones(
+            (attention_batch_size, 1, attention_length, attention_length),
+            dtype=np.bool_,
+        )
     )
 
   h = embeddings
+  # Grouping phases are folded into the batch dimension. Shrinking each tile
+  # by G ensures their combined score tile is no larger than the ungrouped tile
+  # (and is G times smaller in score elements for an exact division).
+  attention_block_size = attention_block_size_in_group_tokens(config)
   for _ in range(config.num_layers):
     attention_module = MultiHeadDotProductAttention(
         num_heads=config.num_heads,
         num_hiddens_per_head=config.embedding_dim // config.num_heads,
-        attention_block_size=config.attention_block_size,
+        attention_block_size=attention_block_size,
     )
     if config.attention_block_size is None:
       self_attention = attention_module(
@@ -617,5 +756,26 @@ def transformer_decoder(
     h = hk.Linear(config.embedding_dim)(h)
     h = layer_norm(h + attention)
 
-  logits = hk.Linear(config.vocab_size)(h)
+  phase_logits = hk.Linear(config.vocab_size)(h)
+  num_group_positions = phase_logits.shape[1]
+  phase_logits = jnp.reshape(
+      phase_logits,
+      (
+          batch_size,
+          config.byte_group_size,
+          num_group_positions,
+          config.vocab_size,
+      ),
+  )
+  # [B, G, ceil(T/G), V] -> byte order [B, T, V].
+  logits = jnp.transpose(phase_logits, (0, 2, 1, 3))
+  logits = jnp.reshape(
+      logits,
+      (
+          batch_size,
+          num_group_positions * config.byte_group_size,
+          config.vocab_size,
+      ),
+  )
+  logits = logits[:, :sequence_length, :]
   return jnn.log_softmax(logits, axis=-1)

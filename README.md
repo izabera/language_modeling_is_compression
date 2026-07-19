@@ -96,6 +96,7 @@ Training options are available as command-line flags. For example:
 ```bash
 python train.py \
   --model_size=800k \
+  --byte_group_size=4 \
   --batch_size=1 \
   --training_steps=1000 \
   --learning_rate=1e-4 \
@@ -103,20 +104,31 @@ python train.py \
   --seed=0
 ```
 
-Attention uses an exact blockwise softmax by default. Query and key tiles are
-256 tokens wide, so the model never creates the full
-`batch_size * num_heads * sequence_length * sequence_length` score and
-probability arrays. The causal mask is generated one tile at a time as well.
+The model uses TRACE-style byte grouping by default. Four adjacent history
+bytes are embedded at one quarter of the model width and concatenated into one
+full-width attention token. Target-aligned grouping phases preserve a genuine
+next-byte distribution at every position without exposing the current or any
+future byte. For a 2048-byte sequence, attention therefore operates on four
+independent 512-token phases instead of one 2048-token sequence. Use
+`--byte_group_size=1` to disable grouping; the group size must divide the
+embedding dimension.
+
+Attention also uses an exact blockwise softmax by default. The configured tile
+budget is 256 byte positions, or 64 grouped tokens with the default group size,
+so folding the four grouping phases into the batch dimension does not inflate
+the score tile. The model never creates the full score and probability arrays,
+and the causal mask is generated one tile at a time as well.
 This is especially useful for the default 2048-byte sequences on CPU, where
 JAX's XLA attention implementation is not a memory-efficient FlashAttention
 kernel. The result is mathematically the same as dense attention, subject to
 the usual small floating-point differences from a different summation order.
 
-Use `--attention_block_size=N` to tune the memory/speed tradeoff. Smaller tiles
-use less peak memory; `--attention_block_size=0` restores the released dense
-path. The selected value is stored in new checkpoints. Checkpoints created by
-older versions are automatically kept on dense attention to preserve their
-numerics.
+Use `--attention_block_size=N` to tune the memory/speed tradeoff. This is a
+byte-equivalent budget; the actual grouped-token tile is `ceil(N / group_size)`.
+Smaller tiles use less peak memory; `--attention_block_size=0` restores the
+released dense path. The selected value is stored in new checkpoints.
+Checkpoints created by older versions are automatically kept on dense,
+ungrouped attention to preserve their numerics.
 
 Use `python train.py --help` to see all options, including architecture
 overrides, gradient clipping, logging frequency, sequence length, and output
@@ -125,11 +137,11 @@ counts in this implementation:
 
 | Preset | Embedding dimension | Layers | Heads | Parameters |
 | --- | ---: | ---: | ---: | ---: |
-| `200k` | 64 | 4 | 8 | 231,936 |
-| `800k` | 128 | 4 | 8 | 856,832 |
-| `3.2m` | 256 | 4 | 8 | 3,286,272 |
-| `6.4m` | 256 | 8 | 8 | 6,441,216 |
-| `38m` | 512 | 12 | 8 | 38,066,432 |
+| `200k` | 64 | 4 | 8 | 219,648 |
+| `800k` | 128 | 4 | 8 | 832,256 |
+| `3.2m` | 256 | 4 | 8 | 3,237,120 |
+| `6.4m` | 256 | 8 | 8 | 6,392,064 |
+| `38m` | 512 | 12 | 8 | 37,968,128 |
 
 The labels describe parameter scale and preserve the released implementation's
 default of eight attention heads. The
