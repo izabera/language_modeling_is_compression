@@ -46,9 +46,6 @@ def load(
       # dense operation order, which can affect arithmetic-coded bitstreams at
       # floating-point rounding boundaries.
       config_values.setdefault('attention_block_size', None)
-      # The former byte-level decoder is exactly the group-size-one case. Its
-      # parameter names and shapes remain valid under that configuration.
-      config_values.setdefault('byte_group_size', 1)
       # Before rotary support, embeddings always received fixed sinusoidal
       # encodings. Preserve those numerics for inference and arithmetic
       # decoding when loading an older serialized configuration.
@@ -60,7 +57,6 @@ def load(
       config = dataclasses.replace(
           default_config,
           attention_block_size=None,
-          byte_group_size=1,
           positional_encoding=transformer.SINUSOIDAL_POSITION_ENCODING,
       )
   return params, config

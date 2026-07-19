@@ -117,12 +117,6 @@ _EMBEDDING_DIM = flags.DEFINE_integer(
     None,
     'Embedding width override; by default the model-size preset is used.',
 )
-_BYTE_GROUP_SIZE = flags.DEFINE_integer(
-    'byte_group_size',
-    4,
-    'Adjacent history bytes concatenated into each attention token; 1 '
-    'disables byte grouping.',
-)
 _POSITIONAL_ENCODING = flags.DEFINE_enum(
     'positional_encoding',
     transformer.ROTARY_POSITION_ENCODING,
@@ -148,9 +142,8 @@ _WIDENING_FACTOR = flags.DEFINE_integer(
 _ATTENTION_BLOCK_SIZE = flags.DEFINE_integer(
     'attention_block_size',
     256,
-    'Byte-equivalent query/key tile size for exact blockwise attention; the '
-    'grouped-token tile is this value divided by byte_group_size. 0 uses '
-    'dense attention.',
+    'Query/key tile size for exact blockwise attention; 0 uses dense '
+    'attention.',
 )
 _OUTPUT_PATH = flags.DEFINE_string(
     'output_path', 'params.npz', 'Path for the trained model checkpoint.'
@@ -189,7 +182,6 @@ def _make_optimizer(
 def _resolve_model_config(
     model_size: str,
     embedding_dim: int | None = None,
-    byte_group_size: int = 4,
     positional_encoding: str = transformer.ROTARY_POSITION_ENCODING,
     num_layers: int | None = None,
     num_heads: int | None = None,
@@ -213,7 +205,6 @@ def _resolve_model_config(
   )
   return dataclasses.replace(
       config,
-      byte_group_size=byte_group_size,
       positional_encoding=positional_encoding,
       attention_block_size=attention_block_size,
   )
@@ -243,7 +234,6 @@ def _validate_training_arguments(
       'sequence_length': sequence_length,
       'learning_rate': learning_rate,
       'embedding_dim': config.embedding_dim,
-      'byte_group_size': config.byte_group_size,
       'num_layers': config.num_layers,
       'num_heads': config.num_heads,
       'widening_factor': config.widening_factor,
@@ -325,11 +315,6 @@ def _validate_training_arguments(
         'Rotary positional encoding requires an even head dimension; got '
         f'embedding_dim={config.embedding_dim} and '
         f'num_heads={config.num_heads} (head dimension {head_dimension}).'
-    )
-  if config.embedding_dim % config.byte_group_size:
-    raise ValueError(
-        'embedding_dim must be divisible by byte_group_size; got '
-        f'{config.embedding_dim} and {config.byte_group_size}.'
     )
   if (
       config.attention_block_size is not None
@@ -572,37 +557,29 @@ def train_transformer_decoder(
       convergence_window=convergence_window,
   )
   expected_parameter_count = transformer.parameter_count(config)
-  grouped_attention_block_size = (
-      transformer.attention_block_size_in_group_tokens(config)
-  )
   logging.info(
       'Model: %s parameters, embedding_dim=%d, num_layers=%d, '
-      'num_heads=%d, widening_factor=%d, byte_group_size=%d, '
-      'positional_encoding=%s, attention=%s',
+      'num_heads=%d, widening_factor=%d, positional_encoding=%s, '
+      'attention=%s',
       f'{expected_parameter_count:,}',
       config.embedding_dim,
       config.num_layers,
       config.num_heads,
       config.widening_factor,
-      config.byte_group_size,
       config.positional_encoding,
       (
-          f'blockwise-{grouped_attention_block_size}-groups '
-          f'({config.attention_block_size}-byte budget)'
-          if grouped_attention_block_size is not None
+          f'blockwise-{config.attention_block_size}'
+          if config.attention_block_size is not None
           else 'dense'
       ),
   )
   logging.info(
       'Training: optimizer=%s, learning_rate=%g, batch_size=%d, '
-      'sequence_length=%d, attention_length=%d, seed=%d, '
-      'gradient_clip_norm=%g',
+      'sequence_length=%d, seed=%d, gradient_clip_norm=%g',
       optimizer_name,
       learning_rate,
       batch_size,
       sequence_length,
-      (sequence_length + config.byte_group_size - 1)
-      // config.byte_group_size,
       seed,
       gradient_clip_norm,
   )
@@ -743,7 +720,6 @@ def main(argv: list[str]) -> None:
   config = _resolve_model_config(
       model_size=_MODEL_SIZE.value,
       embedding_dim=_EMBEDDING_DIM.value,
-      byte_group_size=_BYTE_GROUP_SIZE.value,
       positional_encoding=_POSITIONAL_ENCODING.value,
       num_layers=_NUM_LAYERS.value,
       num_heads=_NUM_HEADS.value,
