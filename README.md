@@ -152,6 +152,17 @@ released dense path. The selected value is stored in new checkpoints.
 Checkpoints created by older versions are automatically kept on dense,
 ungrouped attention to preserve their numerics.
 
+New models use rotary positional encodings (RoPE), matching the paper's
+positional-encoding choice. RoPE rotates every adjacent pair across the full
+projected query and key head dimension, with a base of 10,000; values are not
+rotated.
+With byte grouping, rotary positions retain byte-level spacing, so adjacent
+attention tokens are four positions apart at the default group size. Use
+`--positional_encoding=sinusoidal` to reproduce the released implementation's
+fixed additive encodings. Older checkpoints that predate this option are
+automatically interpreted as sinusoidal so their predictions and compressed
+bitstreams remain compatible.
+
 Use `python train.py --help` to see all options, including architecture
 overrides, gradient clipping, logging frequency, sequence length, and output
 path. The available model-size presets have the following exact parameter
@@ -168,9 +179,9 @@ counts in this implementation:
 The labels describe parameter scale and preserve the released implementation's
 default of eight attention heads. The
 [authors' paper configuration notes](https://github.com/google-deepmind/language_modeling_is_compression/issues/15#issuecomment-2231329302)
-specify four heads for the 200K and 800K experiments as well as rotary
-positional encodings, whereas this repository implements fixed sinusoidal
-encodings. Use `--num_heads=4` for the paper's small-model head count. The
+specify four heads for the 200K and 800K experiments. Use `--num_heads=4` for
+the paper's small-model head count, and `--byte_group_size=1` for its ungrouped
+vanilla Transformer. The
 `6.4m` preset is the natural eight-layer extension of the four-layer `3.2m`
 configuration.
 

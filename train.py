@@ -123,6 +123,13 @@ _BYTE_GROUP_SIZE = flags.DEFINE_integer(
     'Adjacent history bytes concatenated into each attention token; 1 '
     'disables byte grouping.',
 )
+_POSITIONAL_ENCODING = flags.DEFINE_enum(
+    'positional_encoding',
+    transformer.ROTARY_POSITION_ENCODING,
+    transformer.POSITIONAL_ENCODINGS,
+    'Position encoding to use; rotary matches the paper, while sinusoidal '
+    'reproduces checkpoints trained with the released implementation.',
+)
 _NUM_LAYERS = flags.DEFINE_integer(
     'num_layers',
     None,
@@ -183,6 +190,7 @@ def _resolve_model_config(
     model_size: str,
     embedding_dim: int | None = None,
     byte_group_size: int = 4,
+    positional_encoding: str = transformer.ROTARY_POSITION_ENCODING,
     num_layers: int | None = None,
     num_heads: int | None = None,
     widening_factor: int | None = None,
@@ -206,6 +214,7 @@ def _resolve_model_config(
   return dataclasses.replace(
       config,
       byte_group_size=byte_group_size,
+      positional_encoding=positional_encoding,
       attention_block_size=attention_block_size,
   )
 
@@ -300,6 +309,22 @@ def _validate_training_arguments(
     raise ValueError(
         'embedding_dim must be divisible by num_heads; got '
         f'{config.embedding_dim} and {config.num_heads}.'
+    )
+  if config.positional_encoding not in transformer.POSITIONAL_ENCODINGS:
+    valid_encodings = ', '.join(transformer.POSITIONAL_ENCODINGS)
+    raise ValueError(
+        f'Unknown positional encoding {config.positional_encoding!r}; '
+        f'expected one of {valid_encodings}.'
+    )
+  head_dimension = config.embedding_dim // config.num_heads
+  if (
+      config.positional_encoding == transformer.ROTARY_POSITION_ENCODING
+      and head_dimension % 2
+  ):
+    raise ValueError(
+        'Rotary positional encoding requires an even head dimension; got '
+        f'embedding_dim={config.embedding_dim} and '
+        f'num_heads={config.num_heads} (head dimension {head_dimension}).'
     )
   if config.embedding_dim % config.byte_group_size:
     raise ValueError(
@@ -552,13 +577,15 @@ def train_transformer_decoder(
   )
   logging.info(
       'Model: %s parameters, embedding_dim=%d, num_layers=%d, '
-      'num_heads=%d, widening_factor=%d, byte_group_size=%d, attention=%s',
+      'num_heads=%d, widening_factor=%d, byte_group_size=%d, '
+      'positional_encoding=%s, attention=%s',
       f'{expected_parameter_count:,}',
       config.embedding_dim,
       config.num_layers,
       config.num_heads,
       config.widening_factor,
       config.byte_group_size,
+      config.positional_encoding,
       (
           f'blockwise-{grouped_attention_block_size}-groups '
           f'({config.attention_block_size}-byte budget)'
@@ -717,6 +744,7 @@ def main(argv: list[str]) -> None:
       model_size=_MODEL_SIZE.value,
       embedding_dim=_EMBEDDING_DIM.value,
       byte_group_size=_BYTE_GROUP_SIZE.value,
+      positional_encoding=_POSITIONAL_ENCODING.value,
       num_layers=_NUM_LAYERS.value,
       num_heads=_NUM_HEADS.value,
       widening_factor=_WIDENING_FACTOR.value,

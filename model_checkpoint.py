@@ -49,11 +49,18 @@ def load(
       # The former byte-level decoder is exactly the group-size-one case. Its
       # parameter names and shapes remain valid under that configuration.
       config_values.setdefault('byte_group_size', 1)
+      # Before rotary support, embeddings always received fixed sinusoidal
+      # encodings. Preserve those numerics for inference and arithmetic
+      # decoding when loading an older serialized configuration.
+      config_values.setdefault(
+          'positional_encoding', transformer.SINUSOIDAL_POSITION_ENCODING
+      )
       config = transformer.TransformerConfig(**config_values)
     else:
       config = dataclasses.replace(
           default_config,
           attention_block_size=None,
           byte_group_size=1,
+          positional_encoding=transformer.SINUSOIDAL_POSITION_ENCODING,
       )
   return params, config

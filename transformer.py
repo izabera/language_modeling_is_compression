@@ -25,6 +25,14 @@ import jax.numpy as jnp
 import numpy as np
 
 
+ROTARY_POSITION_ENCODING = 'rotary'
+SINUSOIDAL_POSITION_ENCODING = 'sinusoidal'
+POSITIONAL_ENCODINGS = (
+    ROTARY_POSITION_ENCODING,
+    SINUSOIDAL_POSITION_ENCODING,
+)
+
+
 @dataclasses.dataclass(kw_only=True)
 class TransformerConfig:
   """Hyperparameters used in the Transformer architectures."""
@@ -44,6 +52,10 @@ class TransformerConfig:
   num_heads: int = 8
   # The parameter initialization scale for the embeddings.
   emb_init_scale: float = 0.02
+  # How positions are represented. The paper uses rotary encodings; the
+  # sinusoidal option is retained for checkpoints produced by the released
+  # implementation.
+  positional_encoding: str = ROTARY_POSITION_ENCODING
   # How much larger the hidden layer of the feedforward network should be
   # compared to the `embedding_dim`.
   widening_factor: int = 4
@@ -460,6 +472,7 @@ class MultiHeadDotProductAttention(hk.Module):
       name: str | None = None,
       *,
       attention_block_size: int | None = 256,
+      positional_encoding: str | None = None,
   ) -> None:
     """Initializes the attention module.
 
@@ -469,6 +482,9 @@ class MultiHeadDotProductAttention(hk.Module):
       name: Name of the module.
       attention_block_size: Maximum query/key tile size for blockwise
         attention, or None to use dense attention.
+      positional_encoding: Positional encoding to apply inside attention.
+        Rotary encoding rotates projected queries and keys; None and
+        `sinusoidal` leave them unchanged.
     """
     super().__init__(name=name)
     if attention_block_size is not None and attention_block_size <= 0:
@@ -476,9 +492,24 @@ class MultiHeadDotProductAttention(hk.Module):
           'attention block size must be positive or None; got '
           f'{attention_block_size}.'
       )
+    if positional_encoding not in (None, *POSITIONAL_ENCODINGS):
+      valid_encodings = ', '.join(POSITIONAL_ENCODINGS)
+      raise ValueError(
+          f'Unknown positional encoding {positional_encoding!r}; expected '
+          f'one of {valid_encodings}.'
+      )
+    if (
+        positional_encoding == ROTARY_POSITION_ENCODING
+        and num_hiddens_per_head % 2
+    ):
+      raise ValueError(
+          'Rotary positional encoding requires an even head dimension; got '
+          f'{num_hiddens_per_head}.'
+      )
     self._num_heads = num_heads
     self._num_hiddens_per_head = num_hiddens_per_head
     self._attention_block_size = attention_block_size
+    self._positional_encoding = positional_encoding
 
   def __call__(
       self,
@@ -487,8 +518,19 @@ class MultiHeadDotProductAttention(hk.Module):
       mask: jax.Array | None = None,
       *,
       is_causal: bool = False,
+      query_positions: jax.Array | None = None,
+      key_positions: jax.Array | None = None,
   ) -> jax.Array:
-    """Returns the output of the multi-head attention."""
+    """Returns the output of the multi-head attention.
+
+    Args:
+      inputs_q: Query inputs with shape [B, Tq, E].
+      inputs_kv: Key/value inputs with shape [B, Tk, E].
+      mask: Optional attention mask broadcastable to [B, H, Tq, Tk].
+      is_causal: Whether queries can attend only to earlier keys.
+      query_positions: Optional integer positions shaped [Tq] or [B, Tq].
+      key_positions: Optional integer positions shaped [Tk] or [B, Tk].
+    """
     batch_size, sequence_length, embedding_size = inputs_q.shape
 
     num_hiddens = self._num_hiddens_per_head * self._num_heads
@@ -516,6 +558,14 @@ class MultiHeadDotProductAttention(hk.Module):
     k = jnp.reshape(k, kv_shape)
     v = jnp.reshape(v, kv_shape)
 
+    if self._positional_encoding == ROTARY_POSITION_ENCODING:
+      if query_positions is None:
+        query_positions = jnp.arange(q.shape[1])
+      if key_positions is None:
+        key_positions = jnp.arange(k.shape[1])
+      q = apply_rotary_encoding(q, query_positions)
+      k = apply_rotary_encoding(k, key_positions)
+
     if self._attention_block_size is None:
       if is_causal:
         query_length = q.shape[1]
@@ -538,6 +588,85 @@ class MultiHeadDotProductAttention(hk.Module):
       )
     output = jnp.reshape(output, (batch_size, sequence_length, num_hiddens))
     return hk.Linear(embedding_size, with_bias=False)(output)
+
+
+def apply_rotary_encoding(
+    x: jax.Array,
+    positions: jax.Array,
+    max_timescale: float = 1e4,
+) -> jax.Array:
+  """Applies the paper's rotary position encoding to adjacent feature pairs.
+
+  Frequencies span the complete per-head dimension, with
+  `theta_i = max_timescale ** (-2 * i / D)`. At position p, each adjacent
+  pair `(x_even, x_odd)` is rotated through `p * theta_i`. This matches the
+  authors' public JAX implementation: queries and keys use this function while
+  values remain unmodified.
+
+  Args:
+    x: An array shaped [B, T, D] or [B, T, H, D].
+    positions: Zero-based positions shaped [T] or [B, T]. A leading dimension
+      of one is broadcast over the input batch.
+    max_timescale: Base used to construct the geometric frequencies.
+
+  Returns:
+    The rotated array, with the same shape and dtype as `x`.
+
+  Raises:
+    ValueError: If shapes are incompatible or the head dimension is odd.
+  """
+  if x.ndim not in (3, 4):
+    raise ValueError(
+        'Rotary positional encoding expects rank-3 or rank-4 inputs; got '
+        f'rank {x.ndim}.'
+    )
+  head_dimension = x.shape[-1]
+  if head_dimension % 2:
+    raise ValueError(
+        'Rotary positional encoding requires an even head dimension; got '
+        f'{head_dimension}.'
+    )
+  if max_timescale <= 0:
+    raise ValueError(
+        f'max_timescale must be positive; got {max_timescale}.'
+    )
+
+  positions = jnp.asarray(positions)
+  if positions.ndim == 1:
+    positions = positions[None, :]
+  if positions.ndim != 2:
+    raise ValueError(
+        'Rotary positions must have shape [T] or [B, T]; got '
+        f'{positions.shape}.'
+    )
+  if positions.shape[1] != x.shape[1]:
+    raise ValueError(
+        'Rotary positions must match the input sequence length; got '
+        f'{positions.shape[1]} and {x.shape[1]}.'
+    )
+  if positions.shape[0] not in (1, x.shape[0]):
+    raise ValueError(
+        'Rotary positions must have batch size one or match the input; got '
+        f'{positions.shape[0]} and {x.shape[0]}.'
+    )
+
+  frequency_indices = jnp.arange(
+      head_dimension // 2, dtype=jnp.float32
+  )
+  inverse_frequencies = max_timescale ** (
+      -frequency_indices / (head_dimension // 2)
+  )
+  angles = positions[..., None] * inverse_frequencies[None, None, :]
+  angles = jnp.repeat(angles, 2, axis=-1)
+  if x.ndim == 4:
+    angles = angles[:, :, None, :]
+
+  pairs = jnp.reshape(x, (*x.shape[:-1], head_dimension // 2, 2))
+  rotated_pairs = jnp.stack((-pairs[..., 1], pairs[..., 0]), axis=-1)
+  rotated = jnp.reshape(rotated_pairs, x.shape)
+  cosine = jnp.cos(angles).astype(x.dtype)
+  sine = jnp.sin(angles).astype(x.dtype)
+  return x * cosine + rotated * sine
 
 
 def sinusoid_position_encoding(
@@ -642,6 +771,12 @@ def embed_grouped_history(
         'byte_group_size must be positive and divide embedding_dim; got '
         f'{group_size} and {embedding_size}.'
     )
+  if config.positional_encoding not in POSITIONAL_ENCODINGS:
+    valid_encodings = ', '.join(POSITIONAL_ENCODINGS)
+    raise ValueError(
+        f'Unknown positional encoding {config.positional_encoding!r}; '
+        f'expected one of {valid_encodings}.'
+    )
 
   byte_embedding_size = embedding_size // group_size
   embs_init = hk.initializers.TruncatedNormal(stddev=config.emb_init_scale)
@@ -666,20 +801,22 @@ def embed_grouped_history(
       ),
   )
 
-  # Preserve byte-level absolute positions: phase r, group position k predicts
-  # byte r + kG. This reduces exactly to the original positional encoding when
-  # G=1 and is invariant to how much future context is present in a call.
-  padded_sequence_length = num_group_positions * group_size
-  all_pos_encodings = sinusoid_position_encoding(
-      sequence_length=padded_sequence_length,
-      hidden_size=embedding_size,
-  )
-  target_positions = (
-      np.arange(group_size)[:, None]
-      + group_size * np.arange(num_group_positions)[None, :]
-  )
-  pos_encodings = all_pos_encodings[target_positions]
-  embeddings = embeddings + pos_encodings[None, ...]
+  if config.positional_encoding == SINUSOIDAL_POSITION_ENCODING:
+    # Preserve byte-level absolute positions: phase r, group position k
+    # predicts byte r + kG. This reduces exactly to the original positional
+    # encoding when G=1 and is invariant to how much future context is present
+    # in a call. Rotary positions are instead applied to queries and keys.
+    padded_sequence_length = num_group_positions * group_size
+    all_pos_encodings = sinusoid_position_encoding(
+        sequence_length=padded_sequence_length,
+        hidden_size=embedding_size,
+    )
+    target_positions = (
+        np.arange(group_size)[:, None]
+        + group_size * np.arange(num_group_positions)[None, :]
+    )
+    pos_encodings = all_pos_encodings[target_positions]
+    embeddings = embeddings + pos_encodings[None, ...]
   return jnp.reshape(
       embeddings,
       (
@@ -693,6 +830,26 @@ def embed_grouped_history(
 def layer_norm(x: jax.Array) -> jax.Array:
   """Helper function for layer norm."""
   return hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
+
+
+def _grouped_position_ids(
+    batch_size: int,
+    num_group_positions: int,
+    group_size: int,
+) -> jax.Array:
+  """Returns byte-aligned positions for phases folded into the batch."""
+  phase_positions = (
+      jnp.arange(group_size, dtype=jnp.int32)[:, None]
+      + group_size
+      * jnp.arange(num_group_positions, dtype=jnp.int32)[None, :]
+  )
+  positions = jnp.broadcast_to(
+      phase_positions[None, ...],
+      (batch_size, group_size, num_group_positions),
+  )
+  return jnp.reshape(
+      positions, (batch_size * group_size, num_group_positions)
+  )
 
 
 def shift_right(sequences: jax.Array) -> jax.Array:
@@ -717,6 +874,11 @@ def transformer_decoder(
   # Embed G-byte history groups in G target-aligned phases. Attention sees
   # ceil(T / G) positions per phase rather than T byte positions.
   embeddings = embed_grouped_history(targets, config)
+  position_ids = _grouped_position_ids(
+      batch_size,
+      embeddings.shape[1],
+      config.byte_group_size,
+  )
 
   causal_mask = None
   if config.attention_block_size is None:
@@ -739,14 +901,23 @@ def transformer_decoder(
         num_heads=config.num_heads,
         num_hiddens_per_head=config.embedding_dim // config.num_heads,
         attention_block_size=attention_block_size,
+        positional_encoding=config.positional_encoding,
     )
     if config.attention_block_size is None:
       self_attention = attention_module(
-          inputs_q=h, inputs_kv=h, mask=causal_mask
+          inputs_q=h,
+          inputs_kv=h,
+          mask=causal_mask,
+          query_positions=position_ids,
+          key_positions=position_ids,
       )
     else:
       self_attention = attention_module(
-          inputs_q=h, inputs_kv=h, is_causal=True
+          inputs_q=h,
+          inputs_kv=h,
+          is_causal=True,
+          query_positions=position_ids,
+          key_positions=position_ids,
       )
     attention = layer_norm(h + self_attention)
 
