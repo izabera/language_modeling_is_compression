@@ -316,8 +316,21 @@ def _make_loss_fn(model: hk.Transformed) -> Any:
   return loss_fn
 
 
+def _initialize_parameters(model: hk.Transformed, seed: int) -> hk.Params:
+  """Initializes shape-independent Transformer parameters cheaply.
+
+  None of the model's parameter shapes depend on the input batch or sequence
+  dimensions. Tracing initialization with one token therefore creates the same
+  parameter tree without running attention over the full training batch.
+  """
+  dummy_sequence = np.zeros((1, 1), dtype=np.uint8)
+  return model.init(jax.random.PRNGKey(seed), dummy_sequence)
+
+
 @functools.partial(
-    jax.jit, static_argnames=('optimizer', 'grad_fn', 'normalize_gradients')
+    jax.jit,
+    static_argnames=('optimizer', 'grad_fn', 'normalize_gradients'),
+    donate_argnums=(0, 1),
 )
 def _update_parameters(
     params: hk.Params,
@@ -326,6 +339,7 @@ def _update_parameters(
     grad_fn: Any,
     optimizer: optax.GradientTransformation,
     normalize_gradients: bool = True,
+    compute_grad_norm: bool = True,
 ) -> tuple[hk.Params, optax.OptState, dict[str, Any]]:
   """Returns updated params and extra logs (like loss, last state etc).
 
@@ -343,6 +357,13 @@ def _update_parameters(
     normalize_gradients: Whether to divide the gradients by the length of the
       sequences, or keep them as is. Using this option guarantees to have the
       same scale across various sequence lengths, and therefore tasks.
+    compute_grad_norm: Whether the returned gradient norm is evaluated. This
+      is a dynamic predicate, so logging and non-logging steps share one
+      compiled update. The unused value is NaN on non-logging steps.
+
+  Note:
+    ``params`` and ``opt_state`` are donated to the compiled update. Callers
+    must use the returned trees and must not reuse the input buffers.
   """
   loss, grad = grad_fn(params, sequences)
   if normalize_gradients:
@@ -351,9 +372,15 @@ def _update_parameters(
   updates, new_opt_state = optimizer.update(grad, opt_state, params)
   new_params = optax.apply_updates(params, updates)
 
+  grad_norm = jax.lax.cond(
+      compute_grad_norm,
+      lambda _: optax.global_norm(grad),
+      lambda _: jnp.asarray(jnp.nan, dtype=loss.dtype),
+      operand=None,
+  )
   log_dict = {
       'loss': loss,
-      'grad_norm_unclipped': optax.global_norm(grad),
+      'grad_norm_unclipped': grad_norm,
   }
 
   return new_params, new_opt_state, log_dict
@@ -461,10 +488,9 @@ def train_transformer_decoder(
     batch_list = [np.frombuffer(seq, dtype=np.uint8) for seq in batch_list]
     return np.array(batch_list, dtype=np.uint8)
 
-  # Initialize parameters.
-  dummy_batch = np.zeros((batch_size, sequence_length), dtype=np.uint8)
-  rng = jax.random.PRNGKey(seed)
-  params = model.init(rng, dummy_batch)
+  # Initialize parameters without tracing a full training-sized attention
+  # computation. Transformer parameter shapes do not depend on B or T.
+  params = _initialize_parameters(model, seed)
   actual_parameter_count = hk.data_structures.tree_size(params)
   if actual_parameter_count != expected_parameter_count:
     raise ValueError(
@@ -489,6 +515,7 @@ def train_transformer_decoder(
   last_loss = 0.0
   for step in tqdm.trange(training_steps, disable=not use_tqdm):
     batch = fetch_random_batch()
+    should_log = log_every > 0 and step % log_every == 0
 
     params, opt_state, logs = _update_parameters(
         params=params,
@@ -497,8 +524,9 @@ def train_transformer_decoder(
         grad_fn=grad_fn,
         optimizer=optimizer,
         normalize_gradients=normalize_gradients,
+        compute_grad_norm=should_log,
     )
-    if log_every > 0 and step % log_every == 0:
+    if should_log:
       nats_per_byte, bits_per_byte, perplexity = _loss_statistics(
           logs['loss'], sequence_length
       )
