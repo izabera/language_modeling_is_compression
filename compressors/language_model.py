@@ -13,23 +13,25 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Implements a lossless compressor with language models (arithmetic coding)."""
+"""Implements a lossless compressor with language models (range coding)."""
 
-from collections.abc import Iterator
 import dataclasses
 import functools
 import os
 from typing import Callable
 
+import constriction
 import haiku as hk
 import jax
 import numpy as np
 
-from language_modeling_is_compression import arithmetic_coder
 from language_modeling_is_compression import constants
 from language_modeling_is_compression import model_checkpoint
 from language_modeling_is_compression import transformer
-from language_modeling_is_compression import utils
+
+
+_CATEGORICAL_MODEL = constriction.stream.model.Categorical(perfect=False)
+_LITTLE_ENDIAN_UINT32 = np.dtype('<u4')
 
 
 def _retrieve_model(
@@ -211,23 +213,23 @@ def _compress_with_predict_fn(
     log_probs = np.vstack(log_probs)
   else:
     log_probs = predict_fn(sequence_array[None])[0, ...]
-  probs = np.exp(log_probs)
+  probs = np.ascontiguousarray(np.exp(log_probs), dtype=np.float32)
 
-  output = list()
-  encoder = arithmetic_coder.Encoder(
-      base=constants.ARITHMETIC_CODER_BASE,
-      precision=constants.ARITHMETIC_CODER_PRECISION,
-      output_fn=output.append,
+  encoder = constriction.stream.queue.RangeEncoder()
+  encoder.encode(
+      sequence_array.astype(np.int32),
+      _CATEGORICAL_MODEL,
+      probs,
   )
-  for pdf, symbol in zip(probs, sequence_array):
-    encoder.encode(utils.normalize_pdf_for_arithmetic_coding(pdf), symbol)
-  encoder.terminate()
-
-  compressed_bits = ''.join(map(str, output))
-  compressed_bytes, num_padded_bits = utils.bits_to_bytes(compressed_bits)
+  compressed_words = encoder.get_compressed()
+  compressed_bytes = compressed_words.astype(
+      _LITTLE_ENDIAN_UINT32, copy=False
+  ).tobytes()
 
   if return_num_padded_bits:
-    return compressed_bytes, num_padded_bits
+    # Constriction's range coder emits complete 32-bit words and its decoder
+    # does not require a separate padding count.
+    return compressed_bytes, 0
 
   return compressed_bytes
 
@@ -238,13 +240,13 @@ def compress(
     use_slow_lossless_compression: bool = False,
     model_path: str = 'params.npz',
 ) -> bytes | tuple[bytes, int]:
-  """Compresses the `data` using arithmetic coding and a pretrained model.
+  """Compresses the `data` using range coding and a pretrained model.
 
   Args:
     data: The data to be compressed.
-    return_num_padded_bits: Whether to return the number of zeros added to the
-      encoded bitstream in order to make it byte-decodeable (i.e., divisible by
-      8). Usually, this is used when the encoded data has to be decoded again.
+    return_num_padded_bits: Whether to also return a padding count for API
+      compatibility. Constriction streams do not require a separate padding
+      count, so this value is always zero.
     use_slow_lossless_compression: Whether to compute the `pdf`s for all tokens
       in the data stream in one go or separately for every proper subsequence.
       When only compressing data (i.e., without decompression) use the first
@@ -272,38 +274,42 @@ def _decompress_with_predict_fn(
     uncompressed_length: int = constants.CHUNK_SIZE_BYTES,
 ) -> bytes:
   """Decompresses data with an already-loaded prediction function."""
-  data_iter = iter(utils.bytes_to_bits(data, num_padded_bits=num_padded_bits))
+  if num_padded_bits:
+    raise ValueError(
+        'Constriction streams do not use padded bits; expected '
+        f'num_padded_bits=0, got {num_padded_bits}.'
+    )
+  if len(data) % _LITTLE_ENDIAN_UINT32.itemsize:
+    raise ValueError(
+        'Compressed data length must be a multiple of 4 bytes for a '
+        f'Constriction stream; got {len(data)}.'
+    )
 
-  # The decoder requires a function that reads digits from {0, 1, ..., base - 1}
-  # from the compressed input and returns `None` when the input is exhausted.
-  def _input_fn(bit_sequence: Iterator[str] = data_iter) -> int | None:
-    try:
-      return int(next(bit_sequence))
-    except StopIteration:
-      return None
-
-  decoder = arithmetic_coder.Decoder(
-      base=constants.ARITHMETIC_CODER_BASE,
-      precision=constants.ARITHMETIC_CODER_PRECISION,
-      input_fn=_input_fn,
+  compressed_words = np.frombuffer(data, dtype=_LITTLE_ENDIAN_UINT32).astype(
+      np.uint32, copy=False
   )
+  decoder = constriction.stream.queue.RangeDecoder(compressed_words)
+
   # We need a dummy token because the language model right-shifts the sequence
   # by one when computing the conditional probabilities. Concretely, at every
   # step, we need the `pdf` of the next token given all currently decompressed
   # tokens, but without a dummy token, the last `pdf` would be that of the last
   # already decompressed token. The value of the dummy token is irrelevant.
-  sequence_array = np.empty((1,), dtype=np.uint8)
-  probs = np.exp(predict_fn(sequence_array[None])[0, ...])
+  sequence_array = np.zeros((uncompressed_length + 1,), dtype=np.uint8)
 
   for idx in range(uncompressed_length):
-    token = decoder.decode(
-        utils.normalize_pdf_for_arithmetic_coding(probs[idx])
+    prefix_with_dummy = sequence_array[: idx + 1]
+    probs = np.ascontiguousarray(
+        np.exp(predict_fn(prefix_with_dummy[None])[0, -1]),
+        dtype=np.float32,
     )
-    sequence_array = np.insert(sequence_array, -1, token)
-    probs = np.exp(predict_fn(sequence_array[None])[0, ...])
+    token = decoder.decode(
+        _CATEGORICAL_MODEL,
+        probs[None],
+    )
+    sequence_array[idx] = token[0]
 
-  # Remove the dummy token and convert to bytes.
-  return sequence_array[:-1].tobytes()
+  return sequence_array[:uncompressed_length].tobytes()
 
 
 def decompress(
@@ -312,14 +318,12 @@ def decompress(
     uncompressed_length: int = constants.CHUNK_SIZE_BYTES,
     model_path: str = 'params.npz',
 ) -> bytes:
-  """Decompresses the `data` using arithmetic coding and a pretrained model.
-
-  See https://en.wikipedia.org/wiki/Arithmetic_coding for details.
+  """Decompresses the `data` using range coding and a pretrained model.
 
   Args:
     data: The data to be decompressed.
-    num_padded_bits: The number of zeros added to the encoded bitstream in order
-      to make it byte-decodeable (i.e., divisble by 8).
+    num_padded_bits: Must be zero. Retained for compatibility with the previous
+      arithmetic-coder API.
     uncompressed_length: The length of the original data stream (in bytes).
     model_path: Path to the trained model checkpoint.
 

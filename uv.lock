@@ -192,6 +192,26 @@ wheels = [
 ]
 
 [[package]]
+name = "constriction"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d3/4b/1f4e93b935094dec6b8c510d90b8701b0eb44b0db531cef7f24e7228d32d/constriction-0.5.0-cp313-cp313-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:10d5299e2df56cb116db62a8ec291b157d648821e05ddc65d2ce629b033b49cb", size = 740363, upload-time = "2026-07-17T21:14:42.077Z" },
+    { url = "https://files.pythonhosted.org/packages/75/7b/90f345d7d78d51648a16e2cf1ca16275973eac36fe81937c9219305dc5cf/constriction-0.5.0-cp313-cp313-macosx_10_12_x86_64.whl", hash = "sha256:e54fe30470f91a93e6126a339c41b339069f85a95b7d20154f21c4d051a712d4", size = 387030, upload-time = "2026-07-17T21:14:43.109Z" },
+    { url = "https://files.pythonhosted.org/packages/57/ef/4b1e733307cb5927cf5fc4e18c950d8f34735affe450298aedc47f5b6c1b/constriction-0.5.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:424aa962db200d80f04b03b1f6b7076ec56d5f1a653eaa0535ccd5eb60328eaa", size = 375626, upload-time = "2026-07-17T21:14:44.129Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/d3/a9a57d4fd8be519db6fac72ccb2bcd94f34e17dd14e3313bcc649e645a17/constriction-0.5.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:345e6e9edc30fb1dfb0e35fadf6ba84e437f177a34e6a9250a56d5e00ae945f9", size = 405668, upload-time = "2026-07-17T21:11:49.972Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/ed/7133cf387e667407209e0a246d9bd2e0c2f8654426b27d83cd62119b1207/constriction-0.5.0-cp313-cp313-win_amd64.whl", hash = "sha256:b9a535c33b204d2ee5b02127a52c673fe491f296abd8638649e8af45868fb21e", size = 305281, upload-time = "2026-07-17T21:41:57.036Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/06/c52aa018be1cce58678c52c00527692163244a577a2a53f3921f7a26da6f/constriction-0.5.0-cp314-cp314-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:c182ba2d82b93a4219f3494efd26cb0c87f865fc3d47645d7a62682f962caa99", size = 745217, upload-time = "2026-07-17T21:14:45.131Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/72/23ba42295a674024c08c87ecf5c04e3892339dc5fc53782bb44028f15a73/constriction-0.5.0-cp314-cp314-macosx_10_12_x86_64.whl", hash = "sha256:46cc636d06f67cb4b6f4dfb1efcb15123d045263b32645c5ced9bbef42de2b2a", size = 389239, upload-time = "2026-07-17T21:14:46.149Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/f5/c584e1985fd8b530bf1fa72f2cd0ad0ab72a830b29560023a1457618ea07/constriction-0.5.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:daeac125e23505d859c2591bbc3287aa0d82205ae3fb92463989ed8157d954cb", size = 378255, upload-time = "2026-07-17T21:14:47.336Z" },
+    { url = "https://files.pythonhosted.org/packages/8a/7d/767130bc6d9bd11c21d13db90bdc6aea7e2f4aad855492db28e36ec68ffb/constriction-0.5.0-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e25e26f01afbb51fafb6593856d4d0d7f9486ab50c450fd8568f2743f81fd9be", size = 406686, upload-time = "2026-07-17T21:11:51.101Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/7b/9a12b0eac13b1d161319e99d5e1743cca66eec365c9aa75b7aff91c944d5/constriction-0.5.0-cp314-cp314-win_amd64.whl", hash = "sha256:28c3d737d75e2af593f707fc0320a232a790a69ab60ed6beeaa6baa8a08d8cef", size = 306943, upload-time = "2026-07-17T21:41:58.129Z" },
+]
+
+[[package]]
 name = "dm-haiku"
 version = "0.0.16"
 source = { registry = "https://pypi.org/simple" }
@@ -482,6 +502,7 @@ dependencies = [
     { name = "absl-py" },
     { name = "audioop-lts" },
     { name = "chex" },
+    { name = "constriction" },
     { name = "dm-haiku" },
     { name = "dm-tree" },
     { name = "jax" },
@@ -499,6 +520,7 @@ requires-dist = [
     { name = "absl-py", specifier = ">=2.5.0" },
     { name = "audioop-lts", specifier = ">=0.2.2" },
     { name = "chex", specifier = ">=0.1.92" },
+    { name = "constriction", specifier = ">=0.5.0" },
     { name = "dm-haiku", specifier = ">=0.0.16" },
     { name = "dm-tree", specifier = ">=0.1.10" },
     { name = "jax", specifier = "==0.10.2" },
