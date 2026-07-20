@@ -145,7 +145,7 @@ Enwik8 chunk, and run for exactly `training_steps` updates. This is the setting
 to use when reproducing a fixed-step training recipe exactly.
 
 Attention uses an exact blockwise softmax by default. Query and key tiles are
-256 tokens wide, so the model never creates the full score and probability
+512 tokens wide, so the model never creates the full score and probability
 arrays. The causal mask is generated one tile at a time as well.
 This is especially useful for the default 2048-byte sequences on CPU, where
 JAX's XLA attention implementation is not a memory-efficient FlashAttention
@@ -171,19 +171,29 @@ counts in this implementation:
 
 | Preset | Embedding dimension | Layers | Heads | Parameters |
 | --- | ---: | ---: | ---: | ---: |
-| `200k` | 64 | 4 | 8 | 231,936 |
-| `800k` | 128 | 4 | 8 | 856,832 |
+| `200k` | 64 | 4 | 4 | 231,936 |
+| `800k` | 128 | 4 | 4 | 856,832 |
 | `3.2m` | 256 | 4 | 8 | 3,286,272 |
 | `6.4m` | 256 | 8 | 8 | 6,441,216 |
 | `38m` | 512 | 12 | 8 | 38,066,432 |
 
-The labels describe parameter scale and preserve the released implementation's
-default of eight attention heads. The
+The labels describe parameter scale. The 200K and 800K presets use the four
+heads that the
 [authors' paper configuration notes](https://github.com/google-deepmind/language_modeling_is_compression/issues/15#issuecomment-2231329302)
-specify four heads for the 200K and 800K experiments. Use `--num_heads=4` for
-the paper's small-model head count. The
+specify for the small-model experiments; the larger presets preserve the
+released implementation's default of eight heads. The
 `6.4m` preset is the natural eight-layer extension of the four-layer `3.2m`
 configuration.
+
+Head count does not affect the parameter count, but it strongly affects CPU
+speed: the attention score arrays scale with the number of heads, and with a
+64-dimensional embedding split eight ways each score matmul contracts over
+just eight elements. On a 4-core AVX-512 Xeon, training the 200K model on
+2048-byte sequences at batch size 32 takes about 33 s/step with the previous
+defaults (eight heads, 256-token tiles), 12.5 s/step with the current
+defaults (four heads, 512-token tiles), and 6.5 s/step with `--num_heads=1`.
+Single-head attention is a modeling change relative to the paper, so verify
+final compression ratios if you use it.
 
 The default batch size is 32, matching the authors' small-model experiments. It
 is intended for the default 200K model; reduce `--batch_size` when using a

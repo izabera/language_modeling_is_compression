@@ -56,28 +56,32 @@ class TransformerConfig:
   widening_factor: int = 4
   # Size of the query and key tiles used by the exact blockwise attention
   # implementation. Set to None to use dense attention.
-  attention_block_size: int | None = 256
+  attention_block_size: int | None = 512
 
 
 # The paper reports rounded parameter counts rather than complete architecture
-# definitions. These presets preserve the released implementation's default of
-# eight attention heads; head count does not affect parameter count. The 6.4M
+# definitions; head count does not affect parameter count. The 200K and 800K
+# presets use the four heads the authors specify for their small-model
+# experiments; the larger presets preserve the released implementation's
+# default of eight heads. Fewer, wider heads are also much faster on CPU: the
+# attention score arrays scale with the head count, so `--num_heads=1` shrinks
+# their memory traffic without changing the parameter count. The 6.4M
 # preset naturally extends the 3.2M model from four to eight layers. The 38M
 # preset continues the family's width doubling (64 -> 128 -> 256 -> 512) at
 # twelve layers: its non-embedding parameter count (37,804,032) rounds to the
 # paper's label exactly as the smaller presets' counts round to theirs
-# (198,912 / 791,040 / 3,154,944 / 6,309,888).rs.
+# (198,912 / 791,040 / 3,154,944 / 6,309,888).
 MODEL_SIZE_PRESETS: Mapping[str, Mapping[str, int]] = {
     '200k': {
         'embedding_dim': 64,
         'num_layers': 4,
-        'num_heads': 8,
+        'num_heads': 4,
         'widening_factor': 4,
     },
     '800k': {
         'embedding_dim': 128,
         'num_layers': 4,
-        'num_heads': 8,
+        'num_heads': 4,
         'widening_factor': 4,
     },
     '3.2m': {
@@ -445,7 +449,7 @@ class MultiHeadDotProductAttention(hk.Module):
       num_hiddens_per_head: int,
       name: str | None = None,
       *,
-      attention_block_size: int | None = 256,
+      attention_block_size: int | None = 512,
       positional_encoding: str | None = None,
   ) -> None:
     """Initializes the attention module.
